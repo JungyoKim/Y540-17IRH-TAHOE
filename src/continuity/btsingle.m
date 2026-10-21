@@ -1,9 +1,11 @@
 // btsingle.m -- bluetoothd (macOS 26.7.1 25G241) fixes for a BCM20702 that has one LE advertising instance.
-// 1. LeBroadcaster::stackDidStart takes the single-instance (legacy) advertising path instead of Apple
-//    multi-advertising (the chip rejects the Apple VSC and the whole advertising stack would stay off).
+// 1. Advertising instances. By default bluetoothd keeps its Apple multi-advertising path and btarb.c answers the
+//    multi-advertising VSCs, putting the instances on the chip's one legacy advertising set in turn. With the kill switch
+//    /Library/NullMoth/no-btmulti (at launch), LeBroadcaster::stackDidStart instead takes the single-instance (legacy)
+//    path (the chip rejects the Apple VSC and the whole advertising stack would otherwise stay off), and item 3 applies.
 // 2. A start that fails with status 101 (it crossed a stop of the one shared instance) takes the path bluetoothd
 //    already uses for status 0x76: "Resetting advertising internal states" and updateAdvertisement 200 ms later.
-// 3. WirelessProximity priority: when the connectable set (NearbyInfo / NearbyAction, which carries the
+// 3. Single-instance path only. WirelessProximity priority: when the connectable set (NearbyInfo / NearbyAction, which carries the
 //    same-account identity and the companion-link request) and a non-connectable set (AirDrop 0x05) are both
 //    wanted, only the connectable set goes to the stack. Otherwise the two sessions replace each other on the
 //    single slot and the iPhone loses the Mac. Kill switch: /Library/NullMoth/no-btprio (checked on every update).
@@ -31,6 +33,7 @@
 static const unsigned char want1[] = {0x31,0xd2,0xf7,0x83,0x90,0,0,0,0xfd,0xff,0xff,0xff,0x0f,0x94,0xc2};
 static const unsigned char want2[] = {0x83,0xfb,0x76,0x0f,0x85,0x3c,0x01,0x00,0x00};
 static FILE *L;
+static int MULTI;   // keep Apple multi-advertising (btarb emulates it) unless /Library/NullMoth/no-btmulti exists at launch
 
 static void lg(const char *fmt, ...) {
   if (!L) return;
@@ -71,8 +74,9 @@ static void patch_binary(void) {
   unsigned char *p = (unsigned char *)(0x100698438 + slide);
   if (memcmp(p, want1, sizeof want1) != 0) { lg("single: bytes mismatch, not patching"); return; }
   static const unsigned char nop3[] = {0x0f, 0x1f, 0x00};
-  kern_return_t kr = poke(p + 12, nop3, 3);
-  lg("single: slide 0x%lx patch kr %d now %02x %02x %02x", (long)slide, kr, p[12], p[13], p[14]);
+  kern_return_t kr = 0;
+  if (MULTI) lg("single: skipped (multi)");
+  else { kr = poke(p + 12, nop3, 3); lg("single: slide 0x%lx patch kr %d now %02x %02x %02x", (long)slide, kr, p[12], p[13], p[14]); }
   unsigned char *q = (unsigned char *)(0x10069b09b + slide);
   if (memcmp(q, want2, sizeof want2) != 0) { lg("retry101: bytes mismatch, not patching"); return; }
   mach_vm_address_t t = near_page((const struct mach_header_64 *)(0x100000000 + slide));
@@ -152,8 +156,10 @@ static id h_rules(id self, SEL _cmd) {
 
 __attribute__((constructor)) static void init(void) {
   L = fopen("/tmp/btsingle.log", "a");
+  MULTI = access("/Library/NullMoth/no-btmulti", F_OK) != 0;
   patch_binary();
   patch_more();
+  if (MULTI) { lg("prio: skipped (multi)"); return; }
   Class C = objc_getClass("WPDAdvertisingManager");
   Method m = C ? class_getInstanceMethod(C, sel_registerName("advertisingRules")) : NULL;
   if (!m) { lg("prio: WPDAdvertisingManager advertisingRules missing"); return; }

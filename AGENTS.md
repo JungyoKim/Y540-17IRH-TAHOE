@@ -134,8 +134,10 @@ working (the CPU still throttles itself at 94 °C). `guard` boosts only below 78
     sudo bash install/y540-install.sh 4
     sudo shutdown -r now
 
-After the restart: System Settings > General > AirDrop & Handoff > **AirPlay Receiver off** (the card has one Bluetooth
-advertising slot and AirDrop needs it). Sign in to iCloud with the same Apple ID as the iPhone and keep Bluetooth on.
+After the restart: System Settings > General > AirDrop & Handoff > **AirPlay Receiver off** (recommended: the card has
+one Bluetooth advertising set, which btarb shares between macOS's advertising instances; with AirPlay Receiver on it is
+untested). Sign in to iCloud with the same Apple ID as the iPhone and keep Bluetooth on. install/verify.sh must show
+"btarb: multi-advertising emulation on" and "advertising instances on the air".
 
 ## 11. Verify
 

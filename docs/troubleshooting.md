@@ -30,10 +30,11 @@
 - **No sound after a macOS update.** The update replaced the patched system volume and the build no longer matches the
   KDK. Reinstall macOS 26.7.1 (keep the data volume) and rerun stages 2 and 4.
 - **Only some 5 GHz channels.** `brcmfx-country` must be `#a` (DeviceProperties of the Wi-Fi card in config.plist).
-- **No AirDrop at all / no Handoff presence.** Run `install/verify.sh`. `/tmp/btsingle.log` must show `now 0f 1f 00`,
-  retry101, legacyconn v1/v2, nouhe and `prio: hooked` for the current bluetoothd pid, and /tmp/btarb.log `btarb loaded`;
-  `defaults read /Library/Preferences/com.apple.bluetooth NCSecondaryAdvInstance` must print 0; AirPlay Receiver must be
-  off.
+- **No AirDrop at all / no Handoff presence.** Run `install/verify.sh`. `/tmp/btsingle.log` must show
+  `single: skipped (multi)`, retry101, legacyconn v1/v2 and nouhe for the current bluetoothd pid, and /tmp/btarb.log
+  `btarb loaded (multi)` followed by `multi: on air inst ...` lines (the instance number, its address and data). To
+  compare with the older single-instance path, create /Library/NullMoth/no-btmulti and restart bluetoothd
+  (`sudo pkill -x bluetoothd`); then `now 0f 1f 00` and `prio: hooked` appear instead.
 - **The iPhone does not list the Mac, or lists it and the transfer fails, while a Bluetooth LE mouse or keyboard is
   connected or being reconnected.** Older builds stopped advertising for as long as the Mac initiated an LE connection
   or held an LE link as master. /tmp/btarb.log must show `adv params scannable ...` or `bd adv params: type 0 -> 2`

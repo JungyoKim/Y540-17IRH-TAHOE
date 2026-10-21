@@ -54,16 +54,24 @@ because it rebuilds the auxiliary kernel collection and clears KextPolicy, which
 
 - **btsingle.dylib** (src/continuity/btsingle.m + btarb.c) patches the running bluetoothd after checking the exact bytes of
   every site, and logs to /tmp/btsingle.log and /tmp/btarb.log:
-  1. Tahoe's bluetoothd always asks for Apple's multi-instance advertising (vendor command 0x148). The BCM20702 answers
-     "unknown command" and bluetoothd leaves its whole advertising stack off: no Handoff, AirDrop or Find My presence. One
-     branch in LeBroadcaster::stackDidStart is flipped so bluetoothd uses the single-instance path.
-     `NCSecondaryAdvInstance = 0` sends the non-connectable sets to that one slot.
+  1. Tahoe's bluetoothd always asks for Apple's multi-instance advertising (vendor commands 0xfd48-0xfd4e: create,
+     remove, parameters, data, scan response, enable and address per instance). The BCM20702 answers "unknown command"
+     and bluetoothd leaves its whole advertising stack off: no Handoff, AirDrop or Find My presence. btarb now answers
+     those commands itself and keeps a table of the instances (bluetoothd creates 4; NearbyInfo / NearbyAction and AirDrop
+     are the ones in use), and a 40 ms scheduler puts the enabled instances on the chip's one legacy advertising set in
+     turn, each with its own address (LE Set Random Address, Parameters, Data, Scan Response, Enable; a slot of about
+     two advertising intervals, 150-700 ms). The VSCs never reach the chip: each goes out as Read Local Version
+     Information and its Command Complete is rewritten to the VSC with status 0. Measured: NearbyInfo and AirDrop on the
+     air side by side from two addresses, AirDrop both ways, no Bluetooth restarts. Kill switch
+     /Library/NullMoth/no-btmulti: one branch in LeBroadcaster::stackDidStart is flipped instead so bluetoothd uses the
+     single-instance path (`NCSecondaryAdvInstance = 0` sends the non-connectable sets to that one slot), and item 3
+     applies.
   2. A start that crossed a stop of the one slot fails with status 101 and bluetoothd never retried, leaving the Mac silent
      for minutes. 101 now takes the retry path bluetoothd already has for status 0x76.
-  3. The connectable set (NearbyInfo / NearbyAction, which carries the same-account identity and the companion-link
-     request) and the AirDrop 0x05 set kept replacing each other on the single slot, so the iPhone lost the Mac. A hook on
-     -[WPDAdvertisingManager advertisingRules] hands only the connectable set to the stack when both are wanted
-     (kill switch /Library/NullMoth/no-btprio).
+  3. Single-instance path (no-btmulti) only: the connectable set (NearbyInfo / NearbyAction, which carries the
+     same-account identity and the companion-link request) and the AirDrop 0x05 set kept replacing each other on the
+     single slot, so the iPhone lost the Mac. A hook on -[WPDAdvertisingManager advertisingRules] hands only the
+     connectable set to the stack when both are wanted (kill switch /Library/NullMoth/no-btprio).
   4. bluetoothd sends the Bluetooth 5 LE Extended Create Connection; the setters of gEnableExtendedCreateConnectionCommand
      (V1, V2) now store 0, so the legacy LE Create Connection is used (no-btlegacyconn).
   5. The chip's LE Supported States (0x1fffffff) lack "connectable advertising + initiating" and "connectable advertising

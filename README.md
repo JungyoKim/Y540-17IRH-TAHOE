@@ -33,8 +33,9 @@ Tested on the reference laptop in October 2026, macOS 26.7.1 (25G241), BCM94352Z
 
 - **Pinned to macOS 26.7.1 (25G241).** Do not update macOS; an update removes the system-volume patches.
 - The macOS brightness slider does not work. The Fn brightness keys do (the firmware handles them).
-- One Bluetooth advertising slot: keep AirPlay Receiver off so AirDrop can advertise. Other Continuity features
-  (Universal Clipboard, Sidecar, Apple Watch unlock) are untested.
+- The Bluetooth chip has one advertising set; the patch shares it between macOS's advertising instances in turn
+  (NearbyInfo and AirDrop together, as on Apple Bluetooth). Keeping AirPlay Receiver off is still recommended (with it on
+  the shared set is untested). Other Continuity features (Universal Clipboard, Sidecar, Apple Watch unlock) are untested.
 - While a Bluetooth LE mouse or keyboard is connected or being reconnected, the Mac keeps advertising but as
   non-connectable (the chip cannot do both), so other devices cannot open an LE connection to it during that time.
   AirDrop works either way.

@@ -19,6 +19,11 @@
 //    rewritten in place; one interrupt read can carry several events and all of them are walked.
 // Kill switches (at launch): /Library/NullMoth/no-btarb (whole shim), /Library/NullMoth/no-btarbscan (hold advertising
 // during master links instead of switching to scannable). Log: /tmp/btarb.log
+// Multi-advertising: bluetoothd's own Apple/Broadcom multi-advertising path (VSC 0xfd48-0xfd4e: create, remove,
+// parameters, data, scan response, enable, address per instance) is answered here instead of by the chip, and the
+// enabled instances take turns on the chip's one legacy advertising set, each with its own address. So NearbyInfo /
+// NearbyAction (connectable) and AirDrop (non-connectable) go out side by side as on a Mac with Apple Bluetooth.
+// Kill switch (at launch, together with btsingle.m): /Library/NullMoth/no-btmulti goes back to the single-instance path.
 #include <IOKit/IOKitLib.h>
 #include <IOKit/IOCFPlugIn.h>
 #include <IOKit/usb/IOUSBLib.h>
@@ -32,7 +37,7 @@
 #include <sys/time.h>
 #include <time.h>
 
-static FILE *L; static pthread_mutex_t LM = PTHREAD_MUTEX_INITIALIZER; static int NLOG, OFF, NOSCAN;
+static FILE *L; static pthread_mutex_t LM = PTHREAD_MUTEX_INITIALIZER; static int NLOG, OFF, NOSCAN, MULTI;
 static void lg(const char *f, ...) {
   pthread_mutex_lock(&LM);
   if (!L) { L = fopen("/tmp/btarb.log", "a"); if (L) setvbuf(L, NULL, _IOLBF, 0); }
@@ -58,6 +63,12 @@ static uint16_t masters[8]; static int nMasters;
 static uint8_t parWant[15], parHw[15]; static int parWantSet, parHwSet;   // LE Set Advertising Parameters: bluetoothd's last, the chip's
 static uint16_t ourOp; static int ourStatus; static unsigned nHold, nRepro, nBdPar;
 static void *gDev; static IOReturn (*gReq)(void *, IOUSBDevRequest *);
+// ---- multi-advertising (MULTI unless /Library/NullMoth/no-btmulti exists at launch) ----
+// bluetoothd's Broadcom multi-advertising VSCs (OGF 0x3f, OCF 0x148-0x14e) never reach the chip: each goes out as HCI
+// Read Local Version Information, and that Command Complete comes back rewritten to the VSC opcode with status 0 (plus
+// an instance handle for 0xfd48, Create).
+static uint8_t subCmd[3] = {0x01, 0x10, 0x00};
+static int fakeOp, fakeRetLen; static uint8_t fakeRet[2];
 static int connType(int t) { return t == 0x00 || t == 0x01 || t == 0x04; }
 static int hwConn(void) { return parHwSet ? connType(parHw[4]) : connType(advType); }
 static int constrained(void) { return initiating || nMasters > 0; }
@@ -74,8 +85,8 @@ static void scannable(uint8_t *p) {   // 15 parameter bytes: ADV_IND -> ADV_SCAN
 
 static int sendCmd(uint16_t op, const uint8_t *p, unsigned len, const char *why) {
   if (!gDev || !gReq) { lg("inject %04x (%s): no device\n", op, why); return 0; }
-  if (len > 16) return 0;
-  uint8_t cmd[3 + 16]; cmd[0] = op & 0xff; cmd[1] = op >> 8; cmd[2] = (uint8_t)len; memcpy(cmd + 3, p, len);
+  if (len > 32) return 0;
+  uint8_t cmd[3 + 32]; cmd[0] = op & 0xff; cmd[1] = op >> 8; cmd[2] = (uint8_t)len; memcpy(cmd + 3, p, len);
   IOUSBDevRequest q = {0x21, 0x00, 0, 0, (UInt16)(3 + len), cmd, 0};
   ourOut++; ourOp = op; ourStatus = -1;
   IOReturn r = gReq(gDev, &q);
@@ -109,15 +120,132 @@ static int reprogram(int sc, const char *why) {
   return 1;
 }
 
-// HCI command from bluetoothd (control transfer data). May rewrite the payload in place.
-static void onCommand(uint8_t *d, unsigned n) {
-  if (OFF || n < 3) return;
+// ---- multi-advertising emulation (MULTI) ----
+// bluetoothd keeps up to MAXI advertising instances through the VSCs above and then never touches legacy advertising.
+// Each instance's parameters, data, scan response and address are kept here, and the chip's single legacy advertising
+// set carries the enabled instances in turn (a slot of about two advertising intervals each), with the scannable rule
+// above while the Mac initiates or holds a master link. An all-zero instance address gets a non-resolvable private one.
+#define MAXI 8
+typedef struct { int used, en, parSet; uint8_t atype, addr[6], par[7], adv[31], advLen, rsp[31], rspLen; uint32_t dur; } Inst;
+static Inst I[MAXI + 1];
+static int cur, dirty, noAddr, hwAddrSet; static uint64_t curT; static uint8_t hwAddr[6]; static unsigned nSw, nVsc;
+static const uint8_t zero6[6];
+static uint64_t nowMs(void) { struct timeval tv; gettimeofday(&tv, NULL); return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000; }
+static void hexs(const uint8_t *p, unsigned n, char *o, size_t cap) { size_t k = 0; o[0] = 0; for (unsigned j = 0; j < n && k + 3 < cap; j++) k += snprintf(o + k, cap - k, "%02x", p[j]); }
+static void nrpa(uint8_t *a) { arc4random_buf(a, 6); a[5] &= 0x3f; }      // HCI byte order: a[5] is the most significant
+static int run(uint16_t op, const uint8_t *p, unsigned len, const char *why) {   // AM held, chip idle; status or -1
+  if (ourOut > 0 || !sendCmd(op, p, len, why)) return -1;
+  waitOurs();
+  if (ourOut > 0) { lg("multi: %04x (%s) no answer in time\n", op, why); return -1; }
+  if (ourStatus != 0) lg("multi: %04x (%s) status %d\n", op, why, ourStatus);
+  return ourStatus;
+}
+static void multiReset(void) { memset(I, 0, sizeof I); cur = dirty = noAddr = hwAddrSet = 0; }
+// bluetoothd's multi-advertising VSC (payload p, pl bytes): update the table and fill the faked return. AM held.
+static void multiCmd(uint16_t op, const uint8_t *p, unsigned pl) {
+  fakeRet[0] = 0; fakeRetLen = 1;
+  char hx[80]; hexs(p, pl < 38 ? pl : 38, hx, sizeof hx);
+  if (++nVsc <= 300 || nVsc % 200 == 0) lg("vsc %04x %s #%u\n", op, hx, nVsc);
+  int k = pl ? p[0] : 0; Inst *x = (k >= 1 && k <= MAXI && I[k].used) ? &I[k] : NULL;
+  switch (op) {
+  case 0xfd48:                                                     // Create(address type, address) -> handle
+    for (k = 1; k <= MAXI && I[k].used; k++) ;
+    if (k > MAXI || pl < 7) { fakeRet[0] = 0x07; break; }          // Memory Capacity Exceeded
+    memset(&I[k], 0, sizeof I[k]); I[k].used = 1; I[k].atype = p[0]; memcpy(I[k].addr, p + 1, 6);
+    if (!memcmp(I[k].addr, zero6, 6)) { nrpa(I[k].addr); I[k].atype = 1; }
+    fakeRet[1] = (uint8_t)k; fakeRetLen = 2;
+    break;
+  case 0xfd49: if (x) { x->used = x->en = 0; if (cur == k) dirty = 1; } break;                       // Remove
+  case 0xfd4a: if (x && pl >= 8) { memcpy(x->par, p + 1, 7); x->parSet = 1; if (cur == k) dirty = 1; } break;   // Params
+  case 0xfd4b: case 0xfd4c: if (x && pl >= 2) {                                                         // Data / Scan response
+      unsigned n = p[1] > 31 ? 31 : p[1]; if (n > pl - 2) n = pl - 2;
+      uint8_t *dst = op == 0xfd4b ? x->adv : x->rsp; memset(dst, 0, 31); memcpy(dst, p + 2, n);
+      if (op == 0xfd4b) x->advLen = (uint8_t)n; else x->rspLen = (uint8_t)n;
+      if (cur == k) dirty = 1;
+    } break;
+  case 0xfd4d: if (x && pl >= 2) {                                                                      // Enable
+      x->en = p[1] != 0; x->dur = pl >= 6 ? (uint32_t)(p[2] | p[3] << 8 | p[4] << 16 | (uint32_t)p[5] << 24) : 0;
+      if (cur == k) dirty = 1;
+    } break;
+  case 0xfd4e: if (x && pl >= 8) {                                                                      // Address
+      x->atype = p[1]; memcpy(x->addr, p + 2, 6);
+      if (!memcmp(x->addr, zero6, 6)) { nrpa(x->addr); x->atype = 1; }
+      if (cur == k) dirty = 1;
+    } break;
+  }
+}
+static int slotMs(const Inst *x) {
+  unsigned iv = x->parSet ? (unsigned)(x->par[0] | x->par[1] << 8) : 0x100, ms = iv * 5 / 8 * 2 + 20;
+  return ms < 150 ? 150 : ms > 700 ? 700 : (int)ms;
+}
+// Puts instance k (0 = none) on the air. AM held, chip idle, seqBusy set.
+static void putOnAir(int k) {
+  if (advHw) { if (!sendAdvEnable(0, "multi switch")) return; waitOurs(); if (ourOut > 0) return; }
+  advDesired = 0; restorePending = 0;
+  cur = k; curT = nowMs(); dirty = 0;
+  if (!k) { if (++nSw <= 60) lg("multi: nothing to advertise\n"); return; }
+  Inst *x = &I[k];
+  if (x->atype && !noAddr && (!hwAddrSet || memcmp(hwAddr, x->addr, 6))) {
+    int st = run(0x2005, x->addr, 6, "multi address");
+    if (st == 0) { memcpy(hwAddr, x->addr, 6); hwAddrSet = 1; }
+    else if (st > 0) { noAddr = 1; lg("multi: chip refuses address changes (status %d), keeping one address\n", st); }
+    else { dirty = 1; return; }
+  }
+  uint8_t lp[15] = {0};
+  memcpy(lp, x->par, 5); lp[5] = x->atype ? 1 : 0; lp[13] = x->par[5] ? x->par[5] : 7; lp[14] = x->par[6];
+  if (lp[4] == 0x02 || lp[4] == 0x03) {                          // BT 4.0: at least 100 ms for these types
+    unsigned mn = lp[0] | lp[1] << 8, mx = lp[2] | lp[3] << 8;
+    if (mn < 0xa0) mn = 0xa0;
+    if (mx < mn) mx = mn;
+    lp[0] = mn & 0xff; lp[1] = mn >> 8; lp[2] = mx & 0xff; lp[3] = mx >> 8;
+  }
+  memcpy(parWant, lp, 15); parWantSet = 1; advType = lp[4];
+  if (!reprogram(constrained() && canScan(), "multi params")) { dirty = 1; return; }
+  uint8_t dd[32]; dd[0] = x->advLen; memcpy(dd + 1, x->adv, 31);
+  if (run(0x2008, dd, 32, "multi data") < 0) { dirty = 1; return; }
+  dd[0] = x->rspLen; memcpy(dd + 1, x->rsp, 31);
+  if (run(0x2009, dd, 32, "multi scan response") < 0) { dirty = 1; return; }
+  advDesired = 1;
+  if (blocked()) { restorePending = 1; return; }                  // connectable, and the chip cannot advertise it now
+  if (sendAdvEnable(1, "multi on")) waitOurs();
+  nSw++;
+  if (nSw <= 60 || nSw % 200 == 0) {
+    char hx[70]; hexs(x->adv, x->advLen, hx, sizeof hx);
+    lg("multi: on air inst %d type %u -> %u interval %u slot %d addr %02x:%02x:%02x:%02x:%02x:%02x data %s #%u\n", k, x->par[4], parHw[4],
+       parHw[0] | parHw[1] << 8, slotMs(x), hwAddr[5], hwAddr[4], hwAddr[3], hwAddr[2], hwAddr[1], hwAddr[0], hx, nSw);
+  }
+}
+static void multiTick(void *unused) {
+  (void)unused;
+  pthread_mutex_lock(&AM);
+  if (MULTI && !OFF && gDev && bdOut == 0 && ourOut == 0 && !seqBusy) {
+    int act[MAXI], na = 0, curOk = 0, next = -1;
+    for (int k = 1; k <= MAXI; k++) if (I[k].used && I[k].en && I[k].parSet) { act[na++] = k; if (k == cur) curOk = 1; }
+    if (!na) { if (cur || advHw) next = 0; }
+    else if (!curOk) next = act[0];
+    else if (dirty) next = cur;
+    else if (na > 1 && nowMs() - curT >= (uint64_t)slotMs(&I[cur])) { int j = 0; while (act[j] != cur) j++; next = act[(j + 1) % na]; }
+    if (next >= 0) { seqBusy = 1; putOnAir(next); seqBusy = 0; }
+  }
+  pthread_mutex_unlock(&AM);
+}
+
+// HCI command from bluetoothd (control transfer data). May rewrite the payload in place. Returns 1 when the command
+// must go to the chip as subCmd instead.
+static int onCommand(uint8_t *d, unsigned n) {
+  if (OFF || n < 3) return 0;
   uint16_t op = d[0] | (d[1] << 8);
   pthread_mutex_lock(&AM);
   static int thrLogged;
   if (!thrLogged && evThreadSet) { thrLogged = 1; lg("commands on %s thread as events\n", pthread_equal(evThread, pthread_self()) ? "the same" : "a different"); }
-  for (int i = 0; i < 100 && seqBusy; i++) { pthread_mutex_unlock(&AM); usleep(1000); pthread_mutex_lock(&AM); }
+  for (int i = 0; i < 300 && seqBusy; i++) { pthread_mutex_unlock(&AM); usleep(1000); pthread_mutex_lock(&AM); }
   if (ourOut > 0) waitOurs();
+  if (MULTI && op >= 0xfd48 && op <= 0xfd4e) {
+    fakeOp = op; multiCmd(op, d + 3, n - 3);
+    bdOut = 1;
+    pthread_mutex_unlock(&AM);
+    return 1;
+  }
   inCmd = 1;
   if (wantRestore() && op != 0x200a && op != 0x2006 && ourOut == 0) { if (sendAdvEnable(1, "restore before command")) waitOurs(); restorePending = 0; }
   switch (op) {
@@ -151,10 +279,17 @@ static void onCommand(uint8_t *d, unsigned n) {
   bdOut = 1;
   inCmd = 0;
   pthread_mutex_unlock(&AM);
+  return 0;
 }
 
-// One HCI event (e = event code, e[1] = parameter length, elen = e[1] + 2 bytes available). Rewrites in place only.
-static void onOneEvent(uint8_t *e, unsigned elen) {
+// One HCI event (e = event code, e[1] = parameter length, elen = e[1] + 2 bytes available). Rewrites in place; returns
+// the event's new length (shorter only for a faked multi-advertising Command Complete).
+static unsigned onOneEvent(uint8_t *e, unsigned elen) {
+  if (fakeOp && e[0] == 0x0e && elen >= 6 && e[3] == 0x01 && e[4] == 0x10) {    // Read Local Version -> the VSC
+    e[1] = (uint8_t)(3 + fakeRetLen); e[3] = fakeOp & 0xff; e[4] = fakeOp >> 8; memcpy(e + 5, fakeRet, fakeRetLen);
+    if (fakeOp == 0xfd48 || fakeRet[0]) lg("fake cc %04x ret %02x%s%02x\n", fakeOp, fakeRet[0], fakeRetLen > 1 ? " inst " : " ", fakeRetLen > 1 ? fakeRet[1] : 0);
+    fakeOp = 0; elen = 5u + fakeRetLen;
+  }
   int cc = e[0] == 0x0e && elen >= 5, cs = e[0] == 0x0f && elen >= 6;
   if (cc && ourOut > 0 && (e[3] | (e[4] << 8)) == ourOp) {                     // Command Complete for our own command
     ourOut--; ourStatus = elen >= 6 ? e[5] : 255;
@@ -166,7 +301,7 @@ static void onOneEvent(uint8_t *e, unsigned elen) {
     if (op != 0 && *credit) bdOut = 0;
     if (cs && op == 0x200d && e[2] != 0) { initiating = 0; restorePending = 1; lg("create connection status 0x%02x\n", e[2]); }
     if (cc && op == 0x2006 && elen >= 6 && e[5] != 0) { parHwSet = 0; lg("bd adv params status 0x%02x\n", e[5]); }
-    if (cc && op == 0x0c03) { advDesired = advHw = initiating = nMasters = ourOut = bdOut = restorePending = parWantSet = parHwSet = 0; advType = -1; lg("hci reset\n"); }
+    if (cc && op == 0x0c03) { advDesired = advHw = initiating = nMasters = ourOut = bdOut = restorePending = parWantSet = parHwSet = 0; advType = -1; multiReset(); lg("hci reset\n"); }
     else if (wantRestore() && bdOut == 0 && ourOut == 0 && *credit && sendAdvEnable(1, "restore at command end")) { restorePending = 0; *credit = 0; }
   } else if (e[0] == 0x3e && elen >= 7 && (e[2] == 0x01 || e[2] == 0x0a)) {        // LE (Enhanced) Connection Complete
     uint8_t st = e[3], role = e[6]; uint16_t h = (e[4] | (e[5] << 8)) & 0xfff;
@@ -180,9 +315,10 @@ static void onOneEvent(uint8_t *e, unsigned elen) {
     uint16_t h = (e[3] | (e[4] << 8)) & 0xfff;
     for (int i = 0; i < nMasters; i++) if (masters[i] == h) { masters[i] = masters[--nMasters]; if (advDesired && !advHw) restorePending = 1; lg("master 0x%x disconnected (masters %d)\n", h, nMasters); break; }
   }
+  return elen;
 }
 
-// A read from the interrupt pipe can carry more than one event. Walk them all; the length never changes.
+// A read from the interrupt pipe can carry more than one event. Walk them all; the length only shrinks.
 static unsigned onEvent(uint8_t *b, unsigned n) {
   if (OFF || n < 2) return n;
   pthread_mutex_lock(&AM);
@@ -191,7 +327,8 @@ static unsigned onEvent(uint8_t *b, unsigned n) {
   while (i + 2 <= n) {
     unsigned elen = b[i + 1] + 2u;
     if (i + elen > n) break;                       // partial event: leave it alone
-    onOneEvent(b + i, elen);
+    unsigned nl = onOneEvent(b + i, elen);
+    if (nl < elen) { memmove(b + i + nl, b + i + elen, n - (i + elen)); n -= elen - nl; elen = nl; }
     i += elen; cnt++;
   }
   if (cnt > 1) lg("read carried %u events (%u bytes)\n", cnt, n);
@@ -232,13 +369,39 @@ static void rdone(void *r, IOReturn res, void *arg0) {
 static Ctx *mk(IOAsyncCallback1 cb, void *ref, void *buf) { Ctx *c = malloc(sizeof *c); c->cb = cb; c->ref = ref; c->buf = buf; return c; }
 
 typedef IOUSBDeviceInterface942 DV; static DV odv, wdv; static int dvw;
-static void cmdHook(void *s, UInt8 t, void *data, UInt16 len) {
-  if ((t & 0x80) == 0 && (t & 0x60) == 0x20 && data && len >= 3) { if (!gDev) { gDev = s; gReq = (IOReturn (*)(void *, IOUSBDevRequest *))odv.DeviceRequest; } onCommand(data, len); }
+// 1 when the command must go to the chip as subCmd (3 bytes) instead of bluetoothd's bytes
+static int cmdHook(void *s, UInt8 t, void *data, UInt16 len) {
+  if ((t & 0x80) == 0 && (t & 0x60) == 0x20 && data && len >= 3) { if (!gDev) { gDev = s; gReq = (IOReturn (*)(void *, IOUSBDevRequest *))odv.DeviceRequest; } return onCommand(data, len); }
+  return 0;
 }
-static IOReturn dRq(void *s, IOUSBDevRequest *q) { cmdHook(s, q->bmRequestType, q->pData, q->wLength); return odv.DeviceRequest(s, q); }
-static IOReturn dRqA(void *s, IOUSBDevRequest *q, IOAsyncCallback1 cb, void *rf) { cmdHook(s, q->bmRequestType, q->pData, q->wLength); return odv.DeviceRequestAsync(s, q, cb, rf); }
-static IOReturn dRqT(void *s, IOUSBDevRequestTO *q) { cmdHook(s, q->bmRequestType, q->pData, q->wLength); return odv.DeviceRequestTO(s, q); }
-static IOReturn dRqAT(void *s, IOUSBDevRequestTO *q, IOAsyncCallback1 cb, void *rf) { cmdHook(s, q->bmRequestType, q->pData, q->wLength); return odv.DeviceRequestAsyncTO(s, q, cb, rf); }
+typedef struct { IOAsyncCallback1 cb; void *ref; UInt32 len; } SubCtx;
+static void subDone(void *r, IOReturn res, void *arg0) {   // report bluetoothd's own length for a substituted command
+  SubCtx *c = r; IOAsyncCallback1 cb = c->cb; void *ref = c->ref; UInt32 len = c->len; free(c);
+  if (cb) cb(ref, res, res == kIOReturnSuccess ? (void *)(uintptr_t)len : arg0);
+}
+static IOUSBDevRequest subQ; static IOUSBDevRequestTO subQT;
+static IOReturn dRq(void *s, IOUSBDevRequest *q) {
+  if (!cmdHook(s, q->bmRequestType, q->pData, q->wLength)) return odv.DeviceRequest(s, q);
+  IOUSBDevRequest q2 = *q; q2.pData = subCmd; q2.wLength = 3; q2.wLenDone = 0;
+  IOReturn r = odv.DeviceRequest(s, &q2); q->wLenDone = r ? q2.wLenDone : q->wLength; return r;
+}
+static IOReturn dRqA(void *s, IOUSBDevRequest *q, IOAsyncCallback1 cb, void *rf) {
+  if (!cmdHook(s, q->bmRequestType, q->pData, q->wLength)) return odv.DeviceRequestAsync(s, q, cb, rf);
+  subQ = *q; subQ.pData = subCmd; subQ.wLength = 3; subQ.wLenDone = 0;
+  SubCtx *c = malloc(sizeof *c); c->cb = cb; c->ref = rf; c->len = q->wLength;
+  IOReturn r = odv.DeviceRequestAsync(s, &subQ, subDone, c); if (r) free(c); else q->wLenDone = q->wLength; return r;
+}
+static IOReturn dRqT(void *s, IOUSBDevRequestTO *q) {
+  if (!cmdHook(s, q->bmRequestType, q->pData, q->wLength)) return odv.DeviceRequestTO(s, q);
+  IOUSBDevRequestTO q2 = *q; q2.pData = subCmd; q2.wLength = 3; q2.wLenDone = 0;
+  IOReturn r = odv.DeviceRequestTO(s, &q2); q->wLenDone = r ? q2.wLenDone : q->wLength; return r;
+}
+static IOReturn dRqAT(void *s, IOUSBDevRequestTO *q, IOAsyncCallback1 cb, void *rf) {
+  if (!cmdHook(s, q->bmRequestType, q->pData, q->wLength)) return odv.DeviceRequestAsyncTO(s, q, cb, rf);
+  subQT = *q; subQT.pData = subCmd; subQT.wLength = 3; subQT.wLenDone = 0;
+  SubCtx *c = malloc(sizeof *c); c->cb = cb; c->ref = rf; c->len = q->wLength;
+  IOReturn r = odv.DeviceRequestAsyncTO(s, &subQT, subDone, c); if (r) free(c); else q->wLenDone = q->wLength; return r;
+}
 static void wrapdev(void **obj) { if (!dvw) { memcpy(&odv, *obj, sizeof odv); wdv = odv; wdv.DeviceRequest = dRq; wdv.DeviceRequestAsync = dRqA; wdv.DeviceRequestTO = dRqT; wdv.DeviceRequestAsyncTO = dRqAT; dvw = 1; } *obj = &wdv; }
 
 typedef IOUSBInterfaceInterface942 IF; static IF oif, wif; static int ifw;
@@ -275,15 +438,22 @@ kern_return_t btarbCreate(io_service_t sv, CFUUIDRef pt, CFUUIDRef it, IOCFPlugI
 }
 __attribute__((used)) static struct { const void *n, *o; } ip[] __attribute__((section("__DATA,__interpose"))) = { { (const void *)btarbCreate, (const void *)IOCreatePlugInInterfaceForService } };
 #include <dispatch/dispatch.h>
-static dispatch_source_t gTick;
+static dispatch_source_t gTick, gMulti;
 __attribute__((constructor)) static void init(void) {
   OFF = access("/Library/NullMoth/no-btarb", F_OK) == 0;
   NOSCAN = access("/Library/NullMoth/no-btarbscan", F_OK) == 0;
+  MULTI = access("/Library/NullMoth/no-btmulti", F_OK) != 0;
   if (!OFF) {
     gTick = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
     dispatch_source_set_timer(gTick, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), 500 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
     dispatch_source_set_event_handler_f(gTick, tick);
     dispatch_resume(gTick);
   }
-  lg("btarb loaded%s%s\n", OFF ? " (disabled by /Library/NullMoth/no-btarb)" : "", NOSCAN ? " (scannable switch off)" : "");
+  if (!OFF && MULTI) {   // the multi-advertising scheduler runs on its own serial queue every 40 ms
+    gMulti = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_queue_create("nullmoth.btmulti", NULL));
+    dispatch_source_set_timer(gMulti, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), 40 * NSEC_PER_MSEC, 5 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler_f(gMulti, multiTick);
+    dispatch_resume(gMulti);
+  }
+  lg("btarb loaded%s%s%s\n", OFF ? " (disabled by /Library/NullMoth/no-btarb)" : "", NOSCAN ? " (scannable switch off)" : "", MULTI ? " (multi)" : " (single)");
 }

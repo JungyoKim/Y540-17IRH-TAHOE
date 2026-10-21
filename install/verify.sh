@@ -58,10 +58,16 @@ if system_profiler SPAirPortDataType 2>/dev/null | grep -qi 'Card Type: Wi-Fi *(
   plutil -p /System/Library/LaunchAgents/com.apple.sharingd.plist 2>/dev/null | grep -q sdhook && pass "sharingd starts with sdhook" || fail "sharingd plist has no sdhook"
   [ "$(defaults read /Library/Preferences/com.apple.bluetooth NCSecondaryAdvInstance 2>/dev/null)" = 0 ] && pass "NCSecondaryAdvInstance = 0" || fail "NCSecondaryAdvInstance not 0"
   P=$(pgrep -x bluetoothd | head -1)
-  grep -q "pid $P: single: .*now 0f 1f 00" /tmp/btsingle.log 2>/dev/null && pass "btsingle: single-instance advertising path (bluetoothd $P)" || fail "btsingle did not patch bluetoothd $P (see /tmp/btsingle.log)"
+  if [ -e /Library/NullMoth/no-btmulti ]; then
+    grep -q "pid $P: single: .*now 0f 1f 00" /tmp/btsingle.log 2>/dev/null && pass "btsingle: single-instance advertising path (bluetoothd $P, no-btmulti)" || fail "btsingle did not patch bluetoothd $P (see /tmp/btsingle.log)"
+    grep -q "pid $P: prio: hooked" /tmp/btsingle.log 2>/dev/null && pass "btsingle: advertising priority hook" || fail "btsingle: advertising priority hook missing"
+  else
+    grep -q "pid $P: single: skipped (multi)" /tmp/btsingle.log 2>/dev/null && pass "btsingle: Apple multi-advertising path kept (bluetoothd $P)" || fail "btsingle: multi-advertising mode not active in bluetoothd $P (see /tmp/btsingle.log)"
+    grep -q " $P btarb loaded (multi)$" /tmp/btarb.log 2>/dev/null && pass "btarb: multi-advertising emulation on" || fail "btarb: multi-advertising emulation off in bluetoothd $P (see /tmp/btarb.log)"
+    grep -q " $P multi: on air inst " /tmp/btarb.log 2>/dev/null && pass "btarb: advertising instances on the air" || warn "btarb: no advertising instance on the air yet (see /tmp/btarb.log)"
+  fi
   for k in retry101 "legacyconn v1" "legacyconn v2" nouhe; do grep -q "pid $P: $k: .*patch kr 0" /tmp/btsingle.log 2>/dev/null && pass "btsingle: $k" || fail "btsingle: $k not applied (see /tmp/btsingle.log)"; done
-  grep -q "pid $P: prio: hooked" /tmp/btsingle.log 2>/dev/null && pass "btsingle: advertising priority hook" || fail "btsingle: advertising priority hook missing"
-  grep -q " $P btarb loaded$" /tmp/btarb.log 2>/dev/null && pass "btarb: LE advertising/initiating arbiter loaded" || fail "btarb not loaded in bluetoothd $P (see /tmp/btarb.log)"
+  grep -Eq " $P btarb loaded( \((multi|single)\))?$" /tmp/btarb.log 2>/dev/null && pass "btarb: LE advertising/initiating arbiter loaded" || fail "btarb not loaded in bluetoothd $P (see /tmp/btarb.log)"
   if grep -Eq " $P le conn complete status 0x00 handle 0x[0-9a-f]+ role 0 " /tmp/btarb.log 2>/dev/null; then
     grep -Eq " $P (adv params scannable|bd adv params: type 0 -> 2)" /tmp/btarb.log && pass "btarb: advertising kept (scannable) during master links" || warn "btarb: a master link came up but advertising was not switched to scannable (see /tmp/btarb.log)"
   fi
@@ -72,7 +78,7 @@ if system_profiler SPAirPortDataType 2>/dev/null | grep -qi 'Card Type: Wi-Fi *(
     date -j -f '%a %b %d %T %Y' "$(ps -o lstart= -p "$p" | sed 's/^ *//; s/ *$//')" '+%Y-%m-%d %H:%M:%S'
   }
   if [ "$(id -u)" = 0 ]; then
-    S=$(since bluetoothd) && log show --start "$S" --end "$(date -j -v+90S -f '%Y-%m-%d %H:%M:%S' "$S" '+%Y-%m-%d %H:%M:%S')" --style compact --predicate 'process == "bluetoothd" AND eventMessage CONTAINS "advertising instances"' 2>/dev/null | grep -q 'supports 1 advertising' && pass "bluetoothd: LE advertising on, 1 instance" || warn "bluetoothd did not log 'supports 1 advertising instances' at its start"
+    S=$(since bluetoothd) && N=$(log show --start "$S" --end "$(date -j -v+90S -f '%Y-%m-%d %H:%M:%S' "$S" '+%Y-%m-%d %H:%M:%S')" --style compact --predicate 'process == "bluetoothd" AND eventMessage CONTAINS "advertising instances"' 2>/dev/null | grep -oE 'supports [0-9]+ advertising' | tail -1 | awk '{print $2}') && [ -n "$N" ] && pass "bluetoothd: LE advertising on, $N instances" || warn "bluetoothd did not log 'supports N advertising instances' at its start"
     S=$(since sharingd) && log show --start "$S" --end "$(date -j -v+90S -f '%Y-%m-%d %H:%M:%S' "$S" '+%Y-%m-%d %H:%M:%S')" --style compact --predicate 'process == "sharingd" AND eventMessage CONTAINS "SDHOOK loaded"' 2>/dev/null | grep -q 'method=0x' && pass "sdhook active in sharingd" || warn "sharingd did not log 'SDHOOK loaded' at its start (nobody logged in?)"
   fi
 fi

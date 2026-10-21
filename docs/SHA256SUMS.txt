@@ -1,4 +1,4 @@
-1e48f89513193ee5681258aff64dd278484f6a09041e0f70d15c1050accb3859  macos/continuity/btsingle.dylib
+b973e6d8996952703791f93c38a3e510994de4384ac3f8745c65a37a4a4b96fb  macos/continuity/btsingle.dylib
 052bdbf0a54501d74743da6540cc2373e379c0ae93e742c335e2fc3b26eec835  macos/continuity/sdhook.dylib
 97e355a765d51573ddaef7f36052ad223260816de902fc9e3716239355b6831b  macos/nullmoth/daemons/com.nullmoth.y540-dbuf.plist
 2346f3f3d39487720b4da348402bc987dac3f64b9624c11b6de208dc14533786  macos/nullmoth/daemons/com.nullmoth.y540-eet.plist

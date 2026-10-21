@@ -20,7 +20,7 @@ BCM94352Z 카드의 블루투스 광고와 AirDrop은 작은 패치 두 개로 �
 
 - macOS 26.7.1(25G241)에서만 동작해요. **macOS 업데이트를 설치하면 안 돼요.** 시스템 볼륨 패치(소리, Wi-Fi 등)가 지워져요.
 - Samsung PM981 SSD는 macOS에서 동작하지 않아요. WD SN750으로 시험했어요.
-- AirDrop은 BCM94352Z(DW1560) 카드가 필요하고, 설치 뒤 AirPlay 수신 모드를 꺼야 해요(블루투스 광고 슬롯이 하나뿐).
+- AirDrop은 BCM94352Z(DW1560) 카드가 필요해요. 칩의 블루투스 광고 슬롯은 하나지만 패치가 macOS의 광고 여러 개를 번갈아 내보내서, NearbyInfo와 AirDrop이 함께 나가요. AirPlay 수신 모드는 꺼 두기를 권해요(켠 상태는 시험 안 함).
 - macOS 밝기 슬라이더는 동작하지 않아요. Fn 밝기 키는 동작해요.
 
 라이선스는 NullMoth와 같은 PolyForm Noncommercial 1.0.0이에요(무료, 상업적 사용 금지).
