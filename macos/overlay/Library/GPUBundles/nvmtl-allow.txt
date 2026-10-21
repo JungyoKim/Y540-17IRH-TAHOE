@@ -1,0 +1,4 @@
+- DisplaysExt
+# rung 3: everyone; -Name denies
+*
+!WindowServer

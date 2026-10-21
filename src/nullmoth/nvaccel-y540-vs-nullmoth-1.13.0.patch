@@ -1,0 +1,2140 @@
+diff -ruN a/kexts/NVRM/accel/nvaccel_stubs.h b/kexts/NVRM/accel/nvaccel_stubs.h
+--- a/kexts/NVRM/accel/nvaccel_stubs.h	2026-10-15 17:57:03
++++ b/kexts/NVRM/accel/nvaccel_stubs.h	2026-10-15 00:51:35
+@@ -14,12 +14,35 @@
+ #include "IOAccel2DContext2.h"
+ #include "IOAccelCLContext2.h"
+ #include "IOAccelVideoContext2.h"
++// Y540 login-flicker study: every family paging call on a resource, before (phase 0) and after (phase 1) the base class runs.
++void nvFamNote(IOAccelResource2 *res, int op, int phase);
++// macOS 26 made these three IOAccelResource2 methods private; reach Apple's implementation through its vtable (tahoe_fwd.h).
++#ifdef NM_TAHOE
++#define NM_BASE_PAGEON(e, b)        nmBasePageon(e, b)
++#define NM_BASE_PAGEON3(e, b, x)    nmBasePageon3(e, b, x)
++#define NM_BASE_PAGEOFF3(e, b, o)   nmBasePageoff3(e, b, o)
++#else
++#define NM_BASE_PAGEON(e, b)        IOAccelResource2::pageon(e, b)
++#define NM_BASE_PAGEON3(e, b, x)    IOAccelResource2::pageon(e, b, x)
++#define NM_BASE_PAGEOFF3(e, b, o)   IOAccelResource2::pageoff(e, b, o)
++#endif
+ class NVResource : public IOAccelResource2 {
+     OSDeclareDefaultStructors(NVResource)
+     NM_TAHOE_FWD(NVResource)
+ public:
+     unsigned int fPbLogged = 0;
+-    void rebuildPagingBuffer() APPLE_KEXT_OVERRIDE { if (fPbLogged < 4) { fPbLogged++; ALOG("NVResource::rebuildPagingBuffer -- nothing to rebuild until there are page tables (rung 5)"); } }
++    // Y540 lazy BAR1: the family's own paging code reads the BAR1 address straight from the vidmem (+0xc8), so map first.
++    // accdb10: a window mapped only for this paging call goes back to the BAR1 budget when the call returns (the family's
++    // CPU copies run inside lock_vidmem/unlock_vidmem, which map again through addToAperture when they need it).
++    bool lazyMapForFamily(const char *why);
++    void lazyUnmapAfterFamily(bool fresh);
++    void pageon(IOAccelEvent *e, bool b) APPLE_KEXT_OVERRIDE { nvFamNote(this, 0, 0); const bool f = lazyMapForFamily("pageon"); NM_BASE_PAGEON(e, b); lazyUnmapAfterFamily(f); nvFamNote(this, 0, 1); }
++    void pageon(IOAccelEvent *e, bool b, unsigned long long x) APPLE_KEXT_OVERRIDE { nvFamNote(this, 1, 0); const bool f = lazyMapForFamily("pageon/3"); NM_BASE_PAGEON3(e, b, x); lazyUnmapAfterFamily(f); nvFamNote(this, 1, 1); }
++    void pageoff(IOAccelEvent *e, bool b, bool *o) APPLE_KEXT_OVERRIDE { nvFamNote(this, 2, 0); const bool f = lazyMapForFamily("pageoff/3"); NM_BASE_PAGEOFF3(e, b, o); lazyUnmapAfterFamily(f); nvFamNote(this, 2, 1); }
++    void pageonIfNeeded() APPLE_KEXT_OVERRIDE { nvFamNote(this, 3, 0); const bool f = lazyMapForFamily("pageonIfNeeded"); IOAccelResource2::pageonIfNeeded(); lazyUnmapAfterFamily(f); nvFamNote(this, 3, 1); }
++    void pageoffIfNeeded(unsigned int a, unsigned int b) APPLE_KEXT_OVERRIDE { nvFamNote(this, 4, 0); const bool f = lazyMapForFamily("pageoffIfNeeded"); IOAccelResource2::pageoffIfNeeded(a, b); lazyUnmapAfterFamily(f); nvFamNote(this, 4, 1); }
++    void zeroVidMemory(IOAccelEvent *e, unsigned long long n) APPLE_KEXT_OVERRIDE { nvFamNote(this, 5, 0); const bool f = lazyMapForFamily("zeroVidMemory"); IOAccelResource2::zeroVidMemory(e, n); lazyUnmapAfterFamily(f); nvFamNote(this, 5, 1); }
++    void rebuildPagingBuffer() APPLE_KEXT_OVERRIDE { nvFamNote(this, 7, 0); if (fPbLogged < 4) { fPbLogged++; ALOG("NVResource::rebuildPagingBuffer -- nothing to rebuild until there are page tables (rung 5)"); } }
+     uint64_t getLevelOffset(unsigned char a0, unsigned char a1, int* a2) APPLE_KEXT_OVERRIDE {
+         const unsigned char *r = (const unsigned char *)this;
+         if (a2) {
+@@ -52,6 +75,11 @@
+     void pageoff(IOAccelEvent *, bool, bool *, unsigned long long) APPLE_KEXT_OVERRIDE;
+     unsigned int fApLogged = 0;
+     IOMemoryDescriptor *fApDesc = nullptr;
++    // accdb10: fApDesc covers the BAR1 window at fApPhys; a window given back and mapped again lands elsewhere, so a
++    // cached descriptor is rebuilt when the vidmem's window moved. fApVm is the vidmem this resource counted itself into
++    // (fApUsers) between addToAperture and removeFromAperture - the family brackets every CPU mapping with those two.
++    unsigned long long fApPhys = 0, fApBytes = 0;
++    class NVVidMemory *fApVm = nullptr;
+ };
+ OSDefineMetaClassAndStructors(NVResource, IOAccelResource2)
+ class NVSysMemory : public IOAccelSysMemory {
+@@ -60,6 +88,8 @@
+ public:
+ };
+ OSDefineMetaClassAndStructors(NVSysMemory, IOAccelSysMemory)
++// Y540 lazy-BAR1 study: which VRAM buffers does the CPU (family getPhysicalSegment) or the kernel (fKva) ever touch?
++static volatile SInt64 gNvCpuTouch = 0, gNvCpuTouchBytes = 0, gNvCpuTouchLive = 0, gNvKvaTouch = 0, gNvKvaTouchBytes = 0, gNvKvaTouchLive = 0;
+ class NVVidMemory : public IOAccelVidMemory {
+     OSDeclareDefaultStructors(NVVidMemory)
+     NM_TAHOE_FWD(NVVidMemory)
+@@ -70,13 +100,74 @@
+     unsigned long long fPhys     = 0;
+     unsigned long long fBytes    = 0;
+     bool fScanout = false;
++    bool fCpuTouched = false, fKvaTouched = false;
++    bool fLazy = false;
++    // Re-backing guard. The family may evict a surface's VRAM (deallocPhysical) and later back it again (allocPhysical) with
++    // a NEW allocation, e.g. around a display mode change. A Metal client imported the OLD allocation when it made its
++    // texture and keeps drawing there. So an evicted allocation that a client draws into is RETIRED instead of freed: the
++    // driver keeps it in a table (fRetToken) and pages the client's pixels off from it. The table frees an entry nobody
++    // has used for a while, so a surface that was destroyed (the family detaches it before free) cannot leak VRAM.
++    // fBackGen counts real allocations; each import remembers the generation it got and the surface it belongs to.
++    unsigned fBackGen = 0;
++    unsigned fImpSurf = 0, fImpClient[4] = { 0, 0, 0, 0 }, fImpGen[4] = { 0, 0, 0, 0 };
++    unsigned fRetToken = 0, fRetGen = 0;
++    bool fSrcRet = false;                      // the last dirty mark came from a client drawing into the retired allocation
++    bool fEvictHint = false;                   // the family paged this off (pageoffIfNeeded) since it was last backed
++    // accdb10: BAR1 windows of lazy allocations go back to the budget when nothing uses them. fApUsers counts resources
++    // inside the family's addToAperture/removeFromAperture bracket; fKeepMapped marks a buffer our own kernel code read
++    // through fKva (diagnostics, copies) - those stay mapped for good, as before.
++    volatile SInt32 fApUsers = 0;
++    bool fKeepMapped = false;
++    bool releaseLazyMap(const char *why);
++    void releaseRetired();
++    void noteImport(unsigned client, unsigned surf) {
++        if (!client) return;
++        if (surf != fImpSurf) {                // a memory object reused for another surface: forget the old surface's imports
++            for (int i = 0; i < 4; i++) { fImpClient[i] = 0; fImpGen[i] = 0; }
++            releaseRetired(); fSrcRet = false; fImpSurf = surf;
++        }
++        // A client keeps the OLDEST generation it imported: an earlier texture of the same process may still draw there.
++        for (int i = 0; i < 4; i++) if (fImpClient[i] == client) return;
++        int slot = -1;
++        for (int i = 0; i < 4; i++) if (!fImpClient[i]) { slot = i; break; }
++        if (slot < 0) slot = 0;
++        fImpClient[slot] = client; fImpGen[slot] = fBackGen;
++    }
++    // 0 = draws into the current allocation (or unknown), 1 = into the retired one we still hold, 2 = into one we freed
++    int importState(unsigned client, unsigned surf) const {
++        if (!client || surf != fImpSurf) return 0;
++        for (int i = 0; i < 4; i++) if (fImpClient[i] == client)
++            return fImpGen[i] == fBackGen ? 0 : (fRetToken && fImpGen[i] == fRetGen) ? 1 : 2;
++        return 0;
++    }
++    bool importsUse(unsigned gen) const {
++        for (int i = 0; i < 4; i++) if (fImpClient[i] && fImpGen[i] == gen) return true;
++        return false;
++    }
++    bool onlyStaleImports() const {
++        bool stale = false;
++        for (int i = 0; i < 4; i++) if (fImpClient[i]) {
++            if (fImpGen[i] == fBackGen || (fRetToken && fImpGen[i] == fRetGen)) return false;
++            stale = true;
++        }
++        return stale;
++    }
++    bool ensureMapped(bool keep = true);
++    void noteKva() { if (!fKvaTouched && !fScanout && fBytes) { fKvaTouched = true; OSAddAtomic64(1, &gNvKvaTouch); OSAddAtomic64((SInt64)fBytes, &gNvKvaTouchBytes); OSAddAtomic64((SInt64)fBytes, &gNvKvaTouchLive); } }
+ 
+     bool allocPhysical() APPLE_KEXT_OVERRIDE;
+     void deallocPhysical() APPLE_KEXT_OVERRIDE;
+ 
+     uint64_t getPhysicalSegment(unsigned long long a0, unsigned long long* a1) APPLE_KEXT_OVERRIDE {
++        if (fLazy && !fPhys) ensureMapped();
+         const unsigned long long total = *(const volatile unsigned long long *)((const unsigned char *)this + 0x40);
+         if (!fPhys || a0 >= total) { if (a1) *a1 = 0; return 0; }
++        if (!fCpuTouched && !fScanout) {
++            fCpuTouched = true;
++            SInt64 n = OSAddAtomic64(1, &gNvCpuTouch) + 1;
++            OSAddAtomic64((SInt64)fBytes, &gNvCpuTouchBytes); OSAddAtomic64((SInt64)fBytes, &gNvCpuTouchLive);
++            if (n <= 60) ALOG("CPUTOUCH #%lld vm %p %llu bytes caller %p", (long long)n, this, fBytes, __builtin_return_address(0));
++        }
+         if (a1) *a1 = total - a0;
+         return fPhys + a0;
+     }
+diff -ruN a/kexts/NVRM/accel/nvrm-accel.cpp b/kexts/NVRM/accel/nvrm-accel.cpp
+--- a/kexts/NVRM/accel/nvrm-accel.cpp	2026-10-15 17:57:03
++++ b/kexts/NVRM/accel/nvrm-accel.cpp	2026-10-15 17:47:58
+@@ -438,6 +438,20 @@
+         if (!fn) return kIOReturnNoMemory;
+         return fFB->callPlatformFunction(fn, false, r, nullptr, nullptr, nullptr);
+     }
++    const OSSymbol *fSymMap = nullptr;
++    IOReturn askFramebufferForMap(struct NVRMVramRequest *r) {
++        if (!fFB) return kIOReturnNotAttached;
++        if (!fSymMap) fSymMap = OSSymbol::withCStringNoCopy(NVRM_VRAM_FN_MAP);
++        if (!fSymMap) return kIOReturnNoMemory;
++        return fFB->callPlatformFunction(fSymMap, false, r, nullptr, nullptr, nullptr);
++    }
++    const OSSymbol *fSymUnmap = nullptr;
++    IOReturn askFramebufferForUnmap(struct NVRMVramRequest *r) {
++        if (!fFB) return kIOReturnNotAttached;
++        if (!fSymUnmap) fSymUnmap = OSSymbol::withCStringNoCopy("nvUnmapVram");
++        if (!fSymUnmap) return kIOReturnNoMemory;
++        return fFB->callPlatformFunction(fSymUnmap, false, r, nullptr, nullptr, nullptr);
++    }
+     IOReturn askFramebufferForScanout(struct NVRMVramRequest *r, IOService *fb = nullptr) {
+         if (!fb) fb = fFB;
+         if (!fb) return kIOReturnNotAttached;
+@@ -656,17 +670,58 @@
+     return OSDynamicCast(NVVidMemory, o);
+ }
+ 
++// accdb10 BAR1 give-back. NVAccel used to keep every lazily mapped VRAM buffer's BAR1 window until the buffer was freed,
++// and removeFromAperture did nothing. With an external display the 208 MB budget filled up, and at system sleep the
++// family's CPU pageoff of a 14.7 MB (2560x1440) buffer could not get a window - its content was lost at wake (black
++// wallpaper, flicker). IOAcceleratorFamily2 brackets every CPU mapping of a resource: lock_vidmem calls addToAperture when
++// the resource goes from no mapping to one, and unlock_vidmem / free call removeFromAperture when the last one is gone.
++// The window goes back at that point (and after a paging call that mapped only for itself). sysctl debug.nvaccel_ap_release=0
++// keeps every window as before.
++static int gNvApRelease = 1;
++static volatile SInt64 gCntApReleased = 0, gCntApReleasedBytes = 0, gCntApKept = 0, gCntApRebuilt = 0, gCntApBusy = 0;
+ bool NVResource::addToAperture()
+ {
+     NVVidMemory *m = nvres_vidmem(this);
++    if (m && !fApVm) { m->retain(); OSIncrementAtomic(&m->fApUsers); fApVm = m; }
++    if (m) m->ensureMapped(false);
++    const bool ok = m && m->fPhys && m->fBytes;
++    if (!ok && fApVm) { NVVidMemory *v = fApVm; fApVm = nullptr; OSDecrementAtomic(&v->fApUsers); v->release(); }
+     if (fApLogged < 4) { fApLogged++;
+-        ALOG("NVResource::addToAperture -> true (vidmem %p phys 0x%llx %llu bytes, already in BAR1)",
++        ALOG("NVResource::addToAperture -> %d (vidmem %p phys 0x%llx %llu bytes)", (int)ok,
+              m, m ? m->fPhys : 0ull, m ? m->fBytes : 0ull); }
+-    return m && m->fPhys && m->fBytes;
++    return ok;
+ }
+ 
+-void NVResource::removeFromAperture() { }
++void NVResource::removeFromAperture()
++{
++    NVVidMemory *m = fApVm;
++    if (!m) return;
++    fApVm = nullptr;
++    const SInt32 left = OSDecrementAtomic(&m->fApUsers) - 1;
++    if (left <= 0 && gNvApRelease) m->releaseLazyMap("aperture released");
++    else if (left > 0) OSAddAtomic64(1, &gCntApBusy);
++    m->release();
++}
+ 
++static volatile SInt64 gNvLazyFamilyMaps = 0;
++bool NVResource::lazyMapForFamily(const char *why)
++{
++    NVVidMemory *m = nvres_vidmem(this);
++    if (!m || !m->fLazy || m->fKva) return false;
++    if (m->ensureMapped(false)) {
++        SInt64 n = OSAddAtomic64(1, &gNvLazyFamilyMaps) + 1;
++        if (n <= 30) ALOG("LAZYMAP for the family's %s: res %p vidmem %p %llu bytes (#%lld)", why, this, m, m->fBytes, (long long)n);
++        return true;
++    }
++    return false;
++}
++void NVResource::lazyUnmapAfterFamily(bool fresh)
++{
++    if (!fresh || !gNvApRelease) return;
++    NVVidMemory *m = nvres_vidmem(this);
++    if (m) m->releaseLazyMap("paging call done");
++}
++
+ void *NVResource::getApertureMemoryDescriptor(unsigned long long *a0)
+ {
+     if (a0) *a0 = 0;
+@@ -676,17 +731,22 @@
+                  "(sysctl debug.nvaccelfb=4 opens it)"); }
+         return nullptr;
+     }
+-    if (fApDesc) return fApDesc;
+     NVVidMemory *m = nvres_vidmem(this);
++    if (m) m->ensureMapped(false);
+     if (!m || !m->fPhys || !m->fBytes) {
+         if (fApLogged < 8) { fApLogged++;
+             ALOG("NVResource::getApertureMemoryDescriptor: no BAR1-backed vidmem at +0x88 (mem %p)", m); }
+         return nullptr;
+     }
++    if (fApDesc && (fApPhys != m->fPhys || fApBytes != m->fBytes)) {   // accdb10: the window moved since the descriptor was made
++        fApDesc->release(); fApDesc = nullptr; OSAddAtomic64(1, &gCntApRebuilt);
++    }
++    if (fApDesc) return fApDesc;
+     IODeviceMemory *d = IODeviceMemory::withRange((IOPhysicalAddress)m->fPhys, (IOPhysicalLength)m->fBytes);
+     if (!d) { ALOG("NVResource::getApertureMemoryDescriptor: IODeviceMemory::withRange(0x%llx, %llu) FAILED",
+                    m->fPhys, m->fBytes); return nullptr; }
+     fApDesc = d;
++    fApPhys = m->fPhys; fApBytes = m->fBytes;
+     if (fApLogged < 8) { fApLogged++;
+         ALOG("NVResource::getApertureMemoryDescriptor -> %p over BAR1 phys 0x%llx (%llu bytes), offset 0",
+              d, m->fPhys, m->fBytes); }
+@@ -695,11 +755,112 @@
+ 
+ void NVResource::free()
+ {
++    if (NVVidMemory *v = fApVm) { fApVm = nullptr; OSDecrementAtomic(&v->fApUsers); v->release(); }   // accdb10: no give-back here
+     if (fApDesc) { fApDesc->release(); fApDesc = nullptr; }
++    if (NVVidMemory *m = nvres_vidmem(this)) m->releaseRetired();   // Y540: a retired allocation lives as long as its resource
+     OSAddAtomic64(1, &gCntResFree);
+     IOAccelResource2::free();
+ }
+ 
++static SInt64 gCntVmReback, gCntStaleDirty, gCntStalePageoff, gCntVmRetired, gCntRetReleased, gCntRetPageoff, gCntRetReused;
++static SInt64 gCntDirtyReback, gCntDirtyRebackFail;
++static volatile SInt64 gRetLiveBytes;
++
++// ---- Y540 retired-allocation table --------------------------------------------------------------------------------------
++// An evicted allocation a Metal client still draws into is kept here (owned by the table, not by the memory object, which
++// the family may detach or free at any time). Entries nobody has paged off from or drawn into for kNVRetIdleMs are freed.
++#include <mach/mach_time.h>
++struct NVRetEntry { unsigned token, lastMs, gen, surf; void *rm, *kva; unsigned long long bytes, cookie, phys; };
++// y540 accdb9: 10 minutes (was 2). A surface nobody pages back on keeps its retired VRAM only while it sits in this table;
++// a client that draws again after the entry aged out has lost it for good (every later mark is refused and copied out).
++enum { kNVRet = 256, kNVRetIdleMs = 600000 };
++static const SInt64 kNVRetCapBytes = 512ll * 1024 * 1024;
++static NVRetEntry gRet[kNVRet];
++static IOLock *volatile gRetLock;
++static unsigned gRetToken;
++static inline unsigned nvRetNowMs(void) { return (unsigned)(mach_absolute_time() / 1000000ull); }
++static IOLock *nvRetLock(void)
++{
++    if (!gRetLock) { IOLock *l = IOLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gRetLock)) IOLockFree(l); }
++    return gRetLock;
++}
++static void nvRetFree(const NVRetEntry *e)            // never with gRetLock held
++{
++    struct NVRMVramRequest r;
++    for (unsigned i = 0; i < sizeof r; i++) ((volatile unsigned char *)&r)[i] = 0;
++    r.version = NVRM_VRAM_ABI_VERSION; r.handle = e->rm; r.kva = e->kva; r.actualSize = e->bytes; r.allocationCookie = e->cookie;
++    if (NVAccel::gAccel) NVAccel::gAccel->askFramebufferForVram(&r, false);
++    OSAddAtomic64(-(SInt64)e->bytes, &gRetLiveBytes); OSAddAtomic64(1, &gCntRetReleased);
++}
++static unsigned nvRetInsert(void *rm, void *kva, unsigned long long phys, unsigned long long bytes, unsigned long long cookie, unsigned gen, unsigned surf)
++{
++    IOLock *l = nvRetLock(); if (!l) return 0;
++    NVRetEntry victim[8]; int nv = 0; unsigned tok;
++    IOLockLock(l);
++    int slot = -1, lru = 0;
++    for (int i = 0; i < kNVRet; i++) {
++        if (!gRet[i].token) { slot = i; break; }
++        if (gRet[i].lastMs < gRet[lru].lastMs) lru = i;
++    }
++    if (slot < 0) { victim[nv++] = gRet[lru]; slot = lru; }
++    tok = ++gRetToken; if (!tok) tok = ++gRetToken;
++    NVRetEntry *e = &gRet[slot];
++    e->token = tok; e->lastMs = nvRetNowMs(); e->gen = gen; e->surf = surf; e->rm = rm; e->kva = kva; e->bytes = bytes; e->cookie = cookie; e->phys = phys;
++    // keep the table under its byte cap: the least recently used entries go first
++    SInt64 live = gRetLiveBytes + (SInt64)bytes;
++    for (int k = 0; k < kNVRet && live > kNVRetCapBytes && nv < 8; k++) {
++        int old = -1;
++        for (int i = 0; i < kNVRet; i++) if (gRet[i].token && gRet[i].token != tok && (old < 0 || gRet[i].lastMs < gRet[old].lastMs)) old = i;
++        if (old < 0) break;
++        victim[nv++] = gRet[old]; live -= (SInt64)gRet[old].bytes; gRet[old].token = 0;
++    }
++    IOLockUnlock(l);
++    OSAddAtomic64((SInt64)bytes, &gRetLiveBytes);
++    for (int i = 0; i < nv; i++) nvRetFree(&victim[i]);
++    return tok;
++}
++static bool nvRetTake(unsigned tok, NVRetEntry *out)                     // remove WITHOUT freeing: the caller owns it now
++{
++    IOLock *l = nvRetLock(); if (!l || !tok) return false;
++    bool found = false;
++    IOLockLock(l);
++    for (int i = 0; i < kNVRet; i++) if (gRet[i].token == tok) { *out = gRet[i]; gRet[i].token = 0; found = true; break; }
++    IOLockUnlock(l);
++    if (found) OSAddAtomic64(-(SInt64)out->bytes, &gRetLiveBytes);
++    return found;
++}
++static bool nvRetGet(unsigned tok, void **rm, unsigned long long *bytes)     // also marks the entry as in use
++{
++    IOLock *l = nvRetLock(); if (!l || !tok) return false;
++    bool found = false;
++    IOLockLock(l);
++    for (int i = 0; i < kNVRet; i++) if (gRet[i].token == tok) {
++        gRet[i].lastMs = nvRetNowMs(); if (rm) *rm = gRet[i].rm; if (bytes) *bytes = gRet[i].bytes; found = true; break;
++    }
++    IOLockUnlock(l);
++    return found;
++}
++static void nvRetRelease(unsigned tok)
++{
++    IOLock *l = nvRetLock(); if (!l || !tok) return;
++    NVRetEntry e; bool found = false;
++    IOLockLock(l);
++    for (int i = 0; i < kNVRet; i++) if (gRet[i].token == tok) { e = gRet[i]; gRet[i].token = 0; found = true; break; }
++    IOLockUnlock(l);
++    if (found) nvRetFree(&e);
++}
++static void nvRetGC(void)
++{
++    IOLock *l = nvRetLock(); if (!l) return;
++    NVRetEntry dead[16]; int nd = 0;
++    const unsigned now = nvRetNowMs();
++    IOLockLock(l);
++    for (int i = 0; i < kNVRet && nd < 16; i++)
++        if (gRet[i].token && now - gRet[i].lastMs > (unsigned)kNVRetIdleMs) { dead[nd++] = gRet[i]; gRet[i].token = 0; }
++    IOLockUnlock(l);
++    for (int i = 0; i < nd; i++) nvRetFree(&dead[i]);
++}
++// ------------------------------------------------------------------------------------------------------------------------
+ bool NVVidMemory::allocPhysical()
+ {
+     if (fScanout) {
+@@ -717,19 +878,54 @@
+     const unsigned long long want = *(const volatile unsigned long long *)((const unsigned char *)this + 0x40);
+     if (!want) { ALOG("NVVidMemory::allocPhysical(%p): length at +0x40 is 0 -- nothing to back", this); return false; }
+     if (!NVAccel::gAccel) { ALOG("NVVidMemory::allocPhysical(%p): no accelerator", this); return false; }
++    // Y540: backed again after an eviction -- hand back the very VRAM the Metal clients still draw into, so the family's
++    // page-on (which restores the paged-off copy) lands where they draw and nothing ever has to be redirected.
++    if (fRetToken) {
++        NVRetEntry e;
++        const bool got = nvRetTake(fRetToken, &e);
++        fRetToken = 0; fSrcRet = false;
++        if (got && e.bytes >= want) {
++            fRmHandle = e.rm; fKva = e.kva; fPhys = e.kva ? e.phys : 0; fBytes = e.bytes; fAllocationCookie = e.cookie;
++            fLazy = !e.kva;
++            fEvictHint = false;
++            OSAddAtomic64(1, &gCntVmReback); OSAddAtomic64(1, &gCntRetReused);
++            OSAddAtomic64(1, &gCntVmAlloc); OSAddAtomic64((SInt64)fBytes, &gCntVmAllocBytes);
++            *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = fPhys;
++            const SInt64 nu = gCntRetReused;
++            if (nu <= 40) ALOG("NVVidMemory::allocPhysical(%08x): backed again with its OWN retired %llu-byte VRAM (generation %u) -- Metal imports stay valid",
++                               (unsigned)((uintptr_t)this & 0xffffffffu), fBytes, fBackGen);
++            return true;
++        }
++        if (got) nvRetFree(&e);
++    }
+ 
+     struct NVRMVramRequest r;
+     for (unsigned i = 0; i < sizeof r; i++) ((volatile unsigned char *)&r)[i] = 0;
+     r.version = NVRM_VRAM_ABI_VERSION;
+     r.size    = want;
++    static int gLazyArg = -1;
++    if (gLazyArg < 0) { char la[4] = { 0 }; gLazyArg = PE_parse_boot_argn("-nvlazybar1", la, sizeof la) ? 1 : 0;
++                        ALOG("Y540 lazy BAR1 %s", gLazyArg ? "ON (-nvlazybar1): VRAM is mapped into BAR1 only when the CPU needs it" : "off"); }
++    if (gLazyArg) r.flags |= NVRM_VRAM_FLAG_LAZY;
+     IOReturn ret = NVAccel::gAccel->askFramebufferForVram(&r, true);
+-    if (ret != kIOReturnSuccess || !r.handle || !r.phys) {
++    if (ret != kIOReturnSuccess || !r.handle || (!r.phys && !(r.flags & NVRM_VRAM_FLAG_LAZY))) {
+         OSAddAtomic64(1, &gCntVmRefused);
+         ALOG("NVVidMemory::allocPhysical(%p): %llu bytes REFUSED by the framebuffer (0x%x)",
+              this, want, (unsigned)ret);
+         return false;
+     }
+     fRmHandle = r.handle; fKva = r.kva; fPhys = r.phys; fBytes = r.actualSize; fAllocationCookie = r.allocationCookie;
++    fLazy = (r.flags & NVRM_VRAM_FLAG_LAZY) && !r.kva;
++    fBackGen++;
++    fEvictHint = false;
++    nvRetGC();
++    if (fBackGen > 1) {
++        unsigned onRet = 0, lost = 0;
++        for (int i = 0; i < 4; i++) if (fImpClient[i] && fImpGen[i] != fBackGen) { if (fRetToken && fImpGen[i] == fRetGen) onRet++; else lost++; }
++        const SInt64 nb = OSAddAtomic64(1, &gCntVmReback) + 1;
++        if (nb <= 40) ALOG("NVVidMemory::allocPhysical(%08x): RE-BACKED after an eviction (generation %u); %u Metal import(s) draw into the retired generation %u (paged off from there), %u into one already freed (they copy out)",
++                           (unsigned)((uintptr_t)this & 0xffffffffu), fBackGen, onRet, fRetGen, lost);
++    }
+     OSAddAtomic64(1, &gCntVmAlloc); OSAddAtomic64((SInt64)fBytes, &gCntVmAllocBytes);
+     *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = fPhys;
+     ALOG("NVVidMemory::allocPhysical(%p): %llu bytes of REAL VRAM -- phys 0x%llx kva %p [BAR1 %llu]",
+@@ -747,15 +943,101 @@
+     }
+     if (!fRmHandle) return;
+     OSAddAtomic64(1, &gCntVmDealloc); OSAddAtomic64((SInt64)fBytes, &gCntVmDeallocBytes);
+-    struct NVRMVramRequest r;
+-    for (unsigned i = 0; i < sizeof r; i++) ((volatile unsigned char *)&r)[i] = 0;
+-    r.version = NVRM_VRAM_ABI_VERSION;
+-    r.handle = fRmHandle; r.kva = fKva; r.actualSize = fBytes; r.allocationCookie = fAllocationCookie;
+-    if (NVAccel::gAccel) NVAccel::gAccel->askFramebufferForVram(&r, false);
+-    fRmHandle = nullptr; fKva = nullptr; fPhys = 0; fBytes = 0; fAllocationCookie = 0;
++    if (fCpuTouched) { OSAddAtomic64(-(SInt64)fBytes, &gNvCpuTouchLive); fCpuTouched = false; }
++    if (fKvaTouched) { OSAddAtomic64(-(SInt64)fBytes, &gNvKvaTouchLive); fKvaTouched = false; }
++    // Y540: a Metal client draws into this allocation (it imported it); freeing it on an eviction would leave the client
++    // drawing where nobody looks. Keep it in the retired table: an eviction gets it back at the next allocPhysical, a
++    // destroyed surface's copy ages out of the table (kNVRetIdleMs, kNVRetCapBytes).
++    nvRetGC();
++    if (importsUse(fBackGen) && !(fRetToken && importsUse(fRetGen))) {
++        releaseRetired();
++        void *kva = fKva;
++        if (kva && NVAccel::gAccel) {   // the copy engine reads it; give its BAR1 window back
++            struct NVRMVramRequest u;
++            for (unsigned i = 0; i < sizeof u; i++) ((volatile unsigned char *)&u)[i] = 0;
++            u.version = NVRM_VRAM_ABI_VERSION; u.handle = fRmHandle; u.kva = kva; u.actualSize = fBytes; u.allocationCookie = fAllocationCookie;
++            if (NVAccel::gAccel->askFramebufferForUnmap(&u) == kIOReturnSuccess) kva = nullptr;
++        }
++        fRetToken = nvRetInsert(fRmHandle, kva, fPhys, fBytes, fAllocationCookie, fBackGen, fImpSurf);
++        fRetGen = fBackGen; fSrcRet = false;
++        const SInt64 nr = OSAddAtomic64(1, &gCntVmRetired) + 1;
++        if (nr <= 40) ALOG("NVVidMemory::deallocPhysical(%08x): evicted, but surface %u is drawn into by a Metal client -- RETIRED its %llu-byte VRAM (generation %u) instead of freeing it",
++                           (unsigned)((uintptr_t)this & 0xffffffffu), fImpSurf, fBytes, fRetGen);
++    } else {
++        struct NVRMVramRequest r;
++        for (unsigned i = 0; i < sizeof r; i++) ((volatile unsigned char *)&r)[i] = 0;
++        r.version = NVRM_VRAM_ABI_VERSION;
++        r.handle = fRmHandle; r.kva = fKva; r.actualSize = fBytes; r.allocationCookie = fAllocationCookie;
++        if (NVAccel::gAccel) NVAccel::gAccel->askFramebufferForVram(&r, false);
++    }
++    fRmHandle = nullptr; fKva = nullptr; fPhys = 0; fBytes = 0; fAllocationCookie = 0; fLazy = false;
++    fEvictHint = false;
+     *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = 0;
+ }
+ 
++void NVVidMemory::releaseRetired()
++{
++    if (fRetToken) nvRetRelease(fRetToken);
++    fRetToken = 0; fRetGen = 0; fSrcRet = false;
++}
++
++static volatile SInt64 gNvLazyMaps = 0, gNvLazyMapBytes = 0, gNvLazyMapFails = 0;
++static IOLock *gNvLazyLock = nullptr;
++bool NVVidMemory::ensureMapped(bool keep)
++{
++    if (fScanout || !fLazy) return true;
++    if (fKva && (!keep || fKeepMapped)) return true;
++    if (!fRmHandle || !NVAccel::gAccel) return fKva != nullptr;
++    if (!gNvLazyLock) { IOLock *l = IOLockAlloc(); if (!OSCompareAndSwapPtr(nullptr, l, (void * volatile *)&gNvLazyLock)) IOLockFree(l); }
++    IOLockLock(gNvLazyLock);
++    if (keep && !fKeepMapped) { fKeepMapped = true; OSAddAtomic64(1, &gCntApKept); }   // accdb10: our code reads fKva - never give it back
++    bool ok = fKva != nullptr;
++    if (!ok) {
++        struct NVRMVramRequest r;
++        for (unsigned i = 0; i < sizeof r; i++) ((volatile unsigned char *)&r)[i] = 0;
++        r.version = NVRM_VRAM_ABI_VERSION; r.handle = fRmHandle; r.size = fBytes; r.actualSize = fBytes;
++        r.allocationCookie = fAllocationCookie;
++        IOReturn ret = NVAccel::gAccel->askFramebufferForMap(&r);
++        if (ret == kIOReturnSuccess && r.kva && r.phys) {
++            fKva = r.kva; fPhys = r.phys;
++            *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = fPhys;
++            SInt64 n = OSAddAtomic64(1, &gNvLazyMaps) + 1; OSAddAtomic64((SInt64)fBytes, &gNvLazyMapBytes);
++            if (n <= 40) ALOG("LAZYMAP #%lld vm %p %llu bytes -> phys 0x%llx caller %p", (long long)n, this, fBytes, fPhys, __builtin_return_address(0));
++            ok = true;
++        } else {
++            SInt64 n = OSAddAtomic64(1, &gNvLazyMapFails) + 1;
++            if (n <= 20) ALOG("LAZYMAP FAILED vm %p %llu bytes (0x%x) caller %p", this, fBytes, (unsigned)ret, __builtin_return_address(0));
++        }
++    }
++    IOLockUnlock(gNvLazyLock);
++    return ok;
++}
++
++// accdb10: give a lazily mapped buffer's BAR1 window back when no family CPU mapping uses it and our own code never read it
++// through fKva. The family maps again through addToAperture / getApertureMemoryDescriptor the next time it needs the CPU.
++bool NVVidMemory::releaseLazyMap(const char *why)
++{
++    if (!fLazy || fScanout || !fKva || fKeepMapped || !fRmHandle || !NVAccel::gAccel || !gNvLazyLock) return false;
++    IOLockLock(gNvLazyLock);
++    bool done = false; const unsigned long long bytes = fBytes;
++    if (fKva && !fKeepMapped && OSAddAtomic(0, &fApUsers) <= 0) {
++        struct NVRMVramRequest u;
++        for (unsigned i = 0; i < sizeof u; i++) ((volatile unsigned char *)&u)[i] = 0;
++        u.version = NVRM_VRAM_ABI_VERSION; u.handle = fRmHandle; u.kva = fKva; u.actualSize = fBytes; u.allocationCookie = fAllocationCookie;
++        if (NVAccel::gAccel->askFramebufferForUnmap(&u) == kIOReturnSuccess) {
++            fKva = nullptr; fPhys = 0;
++            *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = 0;
++            done = true;
++        }
++    }
++    IOLockUnlock(gNvLazyLock);
++    if (done) {
++        const SInt64 n = OSAddAtomic64(1, &gCntApReleased) + 1; OSAddAtomic64((SInt64)bytes, &gCntApReleasedBytes);
++        if (n <= 20) ALOG("BAR1 give-back #%lld (%s): vm %08x %llu bytes", (long long)n, why, (unsigned)((uintptr_t)this & 0xffffffffu), bytes);
++    }
++    return done;
++}
++
+ class IOSurface {
+ public:
+     IOMemoryDescriptor *getMemoryDescriptor() const;
+@@ -774,6 +1056,22 @@
+ static int    gNvIop = 0;
+ static SInt64 gCntIopOk, gCntIopFail, gCntIopEmpty, gCntIopSrcRes, gCntIopSrcSurf, gCntIopBlank;
+ static SInt64 gCntIopOkHead[kNvMaxFB];
++// Y540 login-flicker study (runtime switches, all default off):
++//   debug.nvaccel_iop_forcesync=1  page a GPU-rendered surface back to system memory on EVERY copied frame, pending or not
++//   debug.nvaccel_iop_holdblank=N  drop up to N consecutive one-colour frames per head (the panel keeps the last frame)
++//   debug.nvaccel_framediag=N      log the next N copied frames (FRAMEDIAG lines)
++static int      gIopForceSync = 0, gIopHoldBlank = 0, gFrameDiag = 0;
++static int      gBootHold = 1, gBootHoldMaxMs = 12000, gBootHoldHeld = 0;   // y540 boothold (see nvBootHoldCheck)
++static uint64_t gBootHoldT0 = 0;
++static unsigned gIopBlankRun[kNvMaxFB];
++static SInt64   gCntIopForced, gCntIopHeld;
++//   debug.nvaccel_famdiag=N        log the next N family paging calls / VRAM shares (FAMDIAG lines)
++//   debug.nvaccel_deepblank=N / deepgood=N   scan whole frames (system memory + VRAM) for the next N blank / good frames
++//   debug.nvaccel_surfledger       per-IOSurface ledger of every share, dirty, copy-engine pageoff, family call and frame
++static int      gFamDiag = 0, gDeepBlank = 2, gDeepGood = 0;
++static unsigned char gHeadGood[kNvMaxFB];
++static void nvSSFrame(IOSurface *s, unsigned head, bool blank, unsigned w, unsigned h, unsigned vmLo);
++static void nvAccelDeepScan(IOSurface *s, unsigned head, bool blank, const volatile unsigned int *src, unsigned w, unsigned h, unsigned pitch);
+ #define NVIOP_LOG_MAX 40
+ static unsigned gIopLogs = 0;
+ #define NVIOPLOG(fmt, ...) do { if (gIopLogs < NVIOP_LOG_MAX) { gIopLogs++; ALOG("iop: " fmt, ##__VA_ARGS__); } } while (0)
+@@ -819,18 +1117,53 @@
+ }
+ 
+ static bool nvAccelIopAsyncBusy(const void *pipe);
++static bool nvAccelDbBusy(const void *pipe);
+ bool NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
+ {
+-    return gNvIop != 0 && !nvAccelIopAsyncBusy(this);
++    return gNvIop != 0 && !nvAccelIopAsyncBusy(this) && !nvAccelDbBusy(this);
+ }
+ 
+-static void nvAccelSurfScanoutSync(IOSurface *s);
++struct NVSyncInfo { int code; unsigned type, fl, v0, v6; unsigned long long vmBytes; int lazy, mapped, haveRes; int vnz, vvaried; unsigned vfirst, vmLo, rmLo; };
++static void nvAccelSurfScanoutSync(IOSurface *s, NVSyncInfo *si = nullptr);
++static void nvAccelSurfInfo(IOSurface *s, NVSyncInfo *si, bool sampleVram, unsigned w, unsigned h, unsigned pitch);
+ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe);
+ static void nvAccelIopHome(IOService *fb, unsigned head);
++// Y540 dbuf (debug.nvaccel_iop_dbuf, boot-arg nvdbuf=1): double-buffered, vsync-latched scan-out of copied frames.
++static int gIopDbuf = 0;
++// Y540 zflip (debug.nvaccel_zflip, needs dbuf on): a frame whose newest pixels are in its IOSurface's own VRAM is flipped
++// to directly - no sync to system memory, no CPU copy. An l10r frame is scanned out as X2B10G10R10 with NVRMFB swapping
++// red and blue in the primary layer's CSC (NVRM_FLIP_FLAG_L10R). 0 off (copies, as before), 1 on: the transaction
++// completes once the flip has latched, so the surface that was on the panel is free before WindowServer draws into it
++// again, 2 on with the transaction completed as soon as the flip is committed (dbearly-like, may let WindowServer start
++// drawing into the previous surface just before the latch). Frames that cannot go straight to the panel take the copy.
++static int gZflip = 0;
++static SInt64 gCntZcFrames, gCntZcRefused, gCntZcNo[6], gCntZcGpuUs, gCntZcGpuMaxUs, gCntZcLatchUs, gCntZcTxnUs, gCntZcTxnMaxUs;
++#ifndef NVRM_FLIP_FLAG_L10R
++#define NVRM_FLIP_FLAG_L10R 0x4u
++#endif
++static SInt64 gCntDbFrames, gCntDbFramesHead[kNvMaxFB], gCntDbFlipFail, gCntDbAllocFail, gCntDbLatchTimeout, gCntDbDirect,
++              gCntDbWaitUs, gCntDbSyncUs, gCntDbCopyUs, gCntDbCopyMaxUs, gCntDbFlipUs, gCntDbSyncRetry, gCntDbBusy, gCntDbHome;
++static SInt64 gCntDbEarly, gCntDbPend;   // y540 dbearly: transactions completed when taken, frames that waited behind one
++static SInt64 gCntPerfUs, gCntPerfN, gCntPerfMaxUs;   // time performTransaction spends on the family's gated path per frame
++// Y540 ws-async (debug.nvaccel_ws_async): GPU writes into an IOSurface that are still in flight (see nvSVInflight)
++static int gWsAsync = 1;
++static SInt64 gCntInflSet, gCntInflClear, gCntInflFull, gCntInflWaits, gCntInflWaitUs, gCntInflWaitMaxUs, gCntInflTimeouts;
++static inline void nvAccelPerfNote(uint64_t t0)
++{
++    const SInt64 us = (SInt64)((mach_absolute_time() - t0) / 1000);
++    OSAddAtomic64(us, &gCntPerfUs); OSAddAtomic64(1, &gCntPerfN);
++    if (us > gCntPerfMaxUs) gCntPerfMaxUs = us;
++}
++static bool nvAccelDbStart(NVDisplayPipe *pipe, IOService *fb, unsigned head, IOSurface *s, const volatile unsigned int *src,
++                           unsigned w, unsigned h, unsigned pitch, bool l10r, const struct NVRMVramRequest *q,
++                           bool zc = false, void *zMem = nullptr, unsigned long long zCookie = 0);
++static bool nvAccelZcResolve(IOService *fb, IOSurface *s, void **mem, unsigned long long *cookie);
++static volatile unsigned int *nvAccelDbLegacyTarget(IOService *fb, unsigned head, const struct NVRMVramRequest *q);
+ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
+ {
+     if (!gNvIop) return (IOReturn)0xe00002c7;
+     if (!txn) NVIOP_FAIL(kIOReturnBadArgument, "performTransaction(NULL)");
++    const uint64_t tPerf0 = mach_absolute_time();
+     NVAccel *a = NVAccel::gAccel;
+     unsigned head = 0;
+     IOService *fb = a ? a->pipeFramebuffer(this, &head) : nullptr;
+@@ -841,6 +1174,13 @@
+     if (!s && !ro) { OSAddAtomic64(1, &gCntIopEmpty); return kIOReturnSuccess; }
+ 
+     const volatile unsigned int *src = nullptr; unsigned w = 0, h = 0, pitch = 0; bool fromRes = false;
++    // Y540 Tahoe: WindowServer on macOS 26 composites into ARGB2101010 ('l10r') surfaces even though the framebuffer only
++    // advertises 32-bit 8 bpc. The scanout is X8R8G8B8, so those frames are narrowed to 8 bits per channel while copying.
++    bool srcL10r = false;
++    bool dbufTry = false;
++    NVSyncInfo syncInfo;
++    for (unsigned i = 0; i < sizeof syncInfo; i++) ((volatile unsigned char *)&syncInfo)[i] = 0;
++    syncInfo.code = -1; syncInfo.vnz = -1; syncInfo.vvaried = -1;
+     NVResource *res = OSDynamicCast(NVResource, ro);
+     NVVidMemory *vm = res ? nvres_vidmem(res) : nullptr;
+     static SInt32 gIopK6Logs;
+@@ -855,6 +1195,7 @@
+              res ? *(const volatile unsigned int *)(kr + 0xb8) : 0u, res ? *(const volatile unsigned int *)(kr + 0xc0) : 0u,
+              vm ? (unsigned long long)vm->fBytes : 0ull, (vm && vm->fKva) ? 1 : 0, vm ? (int)vm->fScanout : -1);
+     }
++    if (!s && vm) vm->ensureMapped();
+     if (!s && vm && vm->fKva) {
+         const unsigned char *rr = (const unsigned char *)res;
+         w     = *(const volatile unsigned short *)(rr + 0xb0);
+@@ -862,14 +1203,19 @@
+         pitch = *(const volatile unsigned int   *)(rr + 0xb8);
+         if ((unsigned long long)pitch < 4ull * w) NVIOP_FAIL(kIOReturnBadArgument, "resource %ux%u: +0xb8 reads %u, which is not a row pitch (need >= %u) — not a surface buffer", w, h, pitch, 4u * w);
+         if ((unsigned long long)h * pitch > vm->fBytes) NVIOP_FAIL(kIOReturnOverrun, "resource %ux%u pitch %u exceeds its %llu bytes", w, h, pitch, (unsigned long long)vm->fBytes);
+-        src = (const volatile unsigned int *)vm->fKva; fromRes = true;
++        vm->noteKva(); src = (const volatile unsigned int *)vm->fKva; fromRes = true;
+     } else if (s && nvAccelIopFlip(fb, head, s, this)) {
+         OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
+         return kIOReturnSuccess;
+     } else if (s) {
+-        nvAccelSurfScanoutSync(s);
++        // dbuf: the per-head worker brings the frame to system memory itself, off the family's gated path
++        dbufTry = gIopDbuf && head < kNvMaxFB && fb->metaCast("NVRMNVDAFramebuffer");
++        if (!dbufTry) nvAccelSurfScanoutSync(s, &syncInfo);
+         const unsigned fmt = s->getPixelFormat();
+-        if (fmt != 0x42475241u) NVIOP_FAIL(kIOReturnUnsupported, "surface 0x%x format 0x%08x is not BGRA", s->getSurfaceID(), fmt);
++        if (fmt != 0x42475241u && fmt != 0x6c313072u) NVIOP_FAIL(kIOReturnUnsupported, "surface 0x%x format 0x%08x is not BGRA or l10r", s->getSurfaceID(), fmt);
++        srcL10r = fmt == 0x6c313072u;
++        if (srcL10r) { static SInt32 gL10rLogs; if (gL10rLogs < 2) { OSIncrementAtomic(&gL10rLogs);
++            ALOG("iop: surface 0x%x is ARGB2101010 (l10r) -- copying it to the 8 bpc scanout with per-pixel narrowing", s->getSurfaceID()); } }
+         const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
+         if (!W || !H || P < 4 || W > 16384 || H > 16384 || P > 16384ull * 8) NVIOP_FAIL(kIOReturnBadArgument, "surface geometry %llux%llu pitch %llu", W, H, P);
+         if (P < 4 * W || (P & 3)) NVIOP_FAIL(kIOReturnBadArgument, "surface %llux%llu: row pitch %llu is under 4*W or not word-aligned", W, H, P);
+@@ -890,10 +1236,63 @@
+     if (ret != kIOReturnSuccess || !q.kva || q.pitch < 4 || !q.height) NVIOP_FAIL(kIOReturnNotReady, "framebuffer would not describe its scanout (0x%x kva %p pitch %u)", (unsigned)ret, q.kva, q.pitch);
+     if (w != q.width || h != q.height) NVIOP_FAIL(kIOReturnBadArgument, "source %ux%u is not the scanout's %ux%u", w, h, q.width, q.height);
+ 
+-    nvAccelIopHome(fb, head);
+-    const unsigned words = (((pitch < q.pitch) ? pitch : q.pitch) & ~3u) / 4;
++    if (dbufTry && !fromRes && s) {
++        void *zMem = nullptr; unsigned long long zCookie = 0;
++        const bool zc = gZflip && nvAccelZcResolve(fb, s, &zMem, &zCookie);
++        if (nvAccelDbStart(this, fb, head, s, src, w, h, pitch, srcL10r, &q, zc, zMem, zCookie)) {
++            OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
++            nvAccelPerfNote(tPerf0);
++            return kIOReturnSuccess;
++        }
++        nvAccelSurfScanoutSync(s, &syncInfo);   // dbuf declined this frame: the copy below needs it in system memory
++    }
++
+     const unsigned spr = pitch / 4, dpr = q.pitch / 4;
+-    volatile unsigned int *d = (volatile unsigned int *)q.kva;
++    unsigned nz = 0, varied = 0; const unsigned first = src[0] & 0xffffffu;
++    for (unsigned i = 0; i < 8; i++) for (unsigned j = 0; j < 8; j++) {
++        unsigned sx = (w * (2 * j + 1)) / 16; if (sx >= spr) sx = spr - 1;
++        const unsigned v = src[(unsigned long)((h * (2 * i + 1)) / 16) * spr + sx] & 0xffffffu;
++        if (v) nz++;
++        if (v != first) varied++;
++    }
++    const bool blank = !varied;
++    if (blank) OSAddAtomic64(1, &gCntIopBlank);
++    bool held = false;
++    if (head < kNvMaxFB) {
++        if (blank && gIopHoldBlank > 0 && gIopBlankRun[head] < (unsigned)gIopHoldBlank) held = true;
++        gIopBlankRun[head] = blank ? gIopBlankRun[head] + 1 : 0;
++    }
++    if (!fromRes && s && gFrameDiag > 0) {
++        static SInt32 gVramSamples;
++        OSDecrementAtomic((volatile SInt32 *)&gFrameDiag);
++        const bool sampleVram = gVramSamples < 48;
++        if (sampleVram) OSIncrementAtomic(&gVramSamples);
++        NVSyncInfo si = syncInfo; nvAccelSurfInfo(s, &si, sampleVram, w, h, pitch);
++        ALOG("FRAMEDIAG %s head %u pipe %05x surf 0x%x %ux%u first 0x%06x nz %u | sync %d (0 not pending, 1 lock busy, 2 synced, 3 pageoff failed, 4 no res, 5 forced) | res %d type 0x%x fl 0x%x valid0 0x%x valid6 0x%x vm %llu lazy %d mapped %d | vram nz %d varied %d first 0x%06x",
++             held ? "HELD " : blank ? "BLANK" : "GOOD ", head, (unsigned)(((uintptr_t)this >> 4) & 0xfffff), s->getSurfaceID(), w, h, first, nz,
++             syncInfo.code, si.haveRes, si.type, si.fl, si.v0, si.v6, si.vmBytes, si.lazy, si.mapped, si.vnz, si.vvaried, si.vfirst);
++    }
++    if (held) { OSAddAtomic64(1, &gCntIopHeld); return kIOReturnSuccess; }
++    if (!fromRes && s && head < kNvMaxFB) {
++        nvSSFrame(s, head, blank, w, h, 0);
++        if (!blank) gHeadGood[head] = 1;
++        if (gHeadGood[head] && ((blank && gDeepBlank > 0) || (!blank && gDeepGood > 0)))
++            nvAccelDeepScan(s, head, blank, src, w, h, pitch);
++    }
++
++    volatile unsigned int *d = nvAccelDbLegacyTarget(fb, head, &q);   // non-null only while a dbuf buffer stays on the panel
++    if (!d) { nvAccelIopHome(fb, head); d = (volatile unsigned int *)q.kva; }
++    const unsigned words = (((pitch < q.pitch) ? pitch : q.pitch) & ~3u) / 4;
++    if (srcL10r) {
++        for (unsigned y = 0; y < h; y++) {
++            const volatile unsigned int *sp = src + (unsigned long)y * spr;
++            volatile unsigned int *dp = d + (unsigned long)y * dpr;
++            for (unsigned x = 0; x < words; x++) {
++                const unsigned v = sp[x];   // A2 R10 G10 B10, little endian: B in bits 0-9, G 10-19, R 20-29
++                dp[x] = 0xff000000u | (((v >> 22) & 0xffu) << 16) | (((v >> 12) & 0xffu) << 8) | ((v >> 2) & 0xffu);
++            }
++        }
++    } else
+     for (unsigned y = 0; y < h; y++) {
+         const volatile unsigned int *sp = src + (unsigned long)y * spr;
+         volatile unsigned int *dp = d + (unsigned long)y * dpr;
+@@ -902,14 +1301,7 @@
+     OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
+     const SInt64 n = OSAddAtomic64(1, &gCntIopOk);
+     const SInt64 nh = OSAddAtomic64(1, &gCntIopOkHead[head]);
+-    unsigned nz = 0, varied = 0; const unsigned first = src[0] & 0xffffffu;
+-    for (unsigned i = 0; i < 8; i++) for (unsigned j = 0; j < 8; j++) {
+-        unsigned sx = (w * (2 * j + 1)) / 16; if (sx >= spr) sx = spr - 1;
+-        const unsigned v = src[(unsigned long)((h * (2 * i + 1)) / 16) * spr + sx] & 0xffffffu;
+-        if (v) nz++;
+-        if (v != first) varied++;
+-    }
+-    if (!varied) OSAddAtomic64(1, &gCntIopBlank);
++    nvAccelPerfNote(tPerf0);
+     if ((n <= 3 || n == 600 || nh == 0) && gIopK6Logs < 12) {
+         OSIncrementAtomic(&gIopK6Logs);
+         ALOG("iop: K6 transaction #%lld (head %u #%lld) on the panel: %ux%u pitch %u from %s — 64 samples: nonzero %u varied %u", (long long)n, head, (long long)nh, w, h, pitch,
+@@ -962,6 +1354,23 @@
+ NVACCEL_CNT(nvaccel_vm_dealloc,       gCntVmDealloc,      "NVVidMemory::deallocPhysical calls with a handle");
+ NVACCEL_CNT(nvaccel_vm_dealloc_bytes, gCntVmDeallocBytes, "bytes of VRAM given back by NVVidMemory");
+ NVACCEL_CNT(nvaccel_vm_refused,       gCntVmRefused,      "allocPhysical refused by the framebuffer");
++NVACCEL_CNT(nvaccel_cpu_touch,        gNvCpuTouch,        "Y540: VRAM buffers whose BAR1 address the family asked for (getPhysicalSegment)");
++NVACCEL_CNT(nvaccel_cpu_touch_bytes,  gNvCpuTouchBytes,   "Y540: bytes of those buffers, cumulative");
++NVACCEL_CNT(nvaccel_cpu_touch_live,   gNvCpuTouchLive,    "Y540: bytes of those buffers still allocated");
++NVACCEL_CNT(nvaccel_kva_touch,        gNvKvaTouch,        "Y540: VRAM buffers read through fKva by the kernel (iop/copyToScanout)");
++NVACCEL_CNT(nvaccel_kva_touch_bytes,  gNvKvaTouchBytes,   "Y540: bytes of those, cumulative");
++NVACCEL_CNT(nvaccel_kva_touch_live,   gNvKvaTouchLive,    "Y540: bytes of those still allocated");
++NVACCEL_CNT(nvaccel_lazy_maps,        gNvLazyMaps,        "Y540: lazy VRAM buffers mapped into BAR1 on demand");
++NVACCEL_CNT(nvaccel_lazy_map_bytes,   gNvLazyMapBytes,    "Y540: bytes of those");
++NVACCEL_CNT(nvaccel_lazy_map_fails,   gNvLazyMapFails,    "Y540: on-demand maps the framebuffer refused");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_ap_release, CTLFLAG_RW | CTLFLAG_LOCKED, &gNvApRelease, 0,
++           "accdb10: 1 = give a lazy buffer's BAR1 window back when the family's last CPU mapping of it is gone, 0 = keep every window");
++NVACCEL_CNT(nvaccel_ap_released,       gCntApReleased,      "accdb10: BAR1 windows given back");
++NVACCEL_CNT(nvaccel_ap_released_bytes, gCntApReleasedBytes, "accdb10: bytes of BAR1 given back");
++NVACCEL_CNT(nvaccel_ap_kept,           gCntApKept,          "accdb10: buffers our own kernel code read through fKva (their window stays)");
++NVACCEL_CNT(nvaccel_ap_rebuilt,        gCntApRebuilt,       "accdb10: aperture descriptors rebuilt because the window moved");
++NVACCEL_CNT(nvaccel_ap_busy,           gCntApBusy,          "accdb10: removeFromAperture while another resource still used the window");
++NVACCEL_CNT(nvaccel_lazy_family_maps, gNvLazyFamilyMaps, "Y540: lazy buffers mapped because the family pages them on/off");
+ NVACCEL_CNT(nvaccel_res_new,          gCntResNew,         "NVResource objects created");
+ NVACCEL_CNT(nvaccel_res_free,         gCntResFree,        "NVResource objects freed");
+ NVACCEL_CNT(nvaccel_map_commit,       gCntMapCommit,      "GPU page-table commits (MAP_MEMORY_DMA ok)");
+@@ -985,6 +1394,30 @@
+ NVACCEL_CNT(nvaccel_iop_src_res,      gCntIopSrcRes,      "K3: frames sourced from our VRAM resource");
+ NVACCEL_CNT(nvaccel_iop_src_surf,     gCntIopSrcSurf,     "K3: frames sourced from the IOSurface memory");
+ NVACCEL_CNT(nvaccel_iop_blank,        gCntIopBlank,       "K6: frames copied whose 64 samples were all ONE colour (a blank frame)");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_forcesync, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gIopForceSync, 0, "Y540: 1 = page a GPU-rendered surface to system memory before every copied frame");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_holdblank, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gIopHoldBlank, 0, "Y540: drop up to N consecutive one-colour frames per head");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_boothold, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gBootHold, 0, "Y540 boothold: 1 = at boot, one-colour frames on the external display (head 1) stay off it (its boot logo stays) until one has content; 0 = off or done");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_boothold_ms, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gBootHoldMaxMs, 0, "Y540 boothold: longest hold after the first held frame, ms");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_boothold_held, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, &gBootHoldHeld, 0, "Y540 boothold: one-colour frames kept off the panel at boot");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_framediag, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gFrameDiag, 0, "Y540: log the next N copied frames (FRAMEDIAG)");
++NVACCEL_CNT(nvaccel_iop_forced,       gCntIopForced,      "Y540: pageoffs forced by nvaccel_iop_forcesync");
++NVACCEL_CNT(nvaccel_iop_held,         gCntIopHeld,        "Y540: one-colour frames dropped by nvaccel_iop_holdblank");
++NVACCEL_CNT(nvaccel_vm_reback,        gCntVmReback,       "Y540: VRAM evicted by the family and backed again with a new allocation");
++NVACCEL_CNT(nvaccel_stale_dirty,      gCntStaleDirty,     "Y540: dirty marks refused because the client's import is an evicted allocation (client copies out)");
++NVACCEL_CNT(nvaccel_stale_pageoff,    gCntStalePageoff,   "Y540: pageoffs skipped because only stale imports draw this surface (system memory is newest)");
++NVACCEL_CNT(nvaccel_vm_retired,       gCntVmRetired,      "Y540: evicted VRAM kept because a Metal client draws into it");
++NVACCEL_CNT(nvaccel_vm_retired_freed, gCntRetReleased,    "Y540: retired VRAM released (resource gone or no longer drawn into)");
++NVACCEL_CNT(nvaccel_vm_retired_live,  gRetLiveBytes,      "Y540: bytes of retired VRAM held right now");
++NVACCEL_CNT(nvaccel_ret_pageoff,      gCntRetPageoff,     "Y540: pageoffs served from a retired allocation");
++NVACCEL_CNT(nvaccel_ret_reused,       gCntRetReused,      "Y540: evicted surfaces backed again with their own retired VRAM");
++NVACCEL_CNT(nvaccel_dirty_reback,     gCntDirtyReback,    "Y540 accdb9: evicted surfaces nobody paged back on, backed again with their retired VRAM at a client's dirty mark");
++NVACCEL_CNT(nvaccel_dirty_reback_fail, gCntDirtyRebackFail, "Y540 accdb9: such re-backs where wire did not back the surface");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_famdiag, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gFamDiag, 0, "Y540: log the next N family paging calls and VRAM shares (FAMDIAG)");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_deepblank, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gDeepBlank, 0, "Y540: whole-frame scans left for blank frames (after a head showed content)");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_deepgood, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gDeepGood, 0, "Y540: whole-frame scans left for good frames");
++static int nvsurfledger_sysctl SYSCTL_HANDLER_ARGS;
++SYSCTL_PROC(_debug, OID_AUTO, nvaccel_surfledger, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, nvsurfledger_sysctl, "A",
++            "Y540: per-IOSurface ledger (shares, dirty marks, copy-engine pageoffs, family paging calls, frames, blank frames)");
+ static int    gIopFlip = 0;
+ static SInt64 gCntIopFlip, gCntIopFlipHome, gCntIopFlipNo[8];
+ SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_flip, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gIopFlip, 0, "1 = scan the composited IOSurface out of its own VRAM (no copy)");
+@@ -1004,6 +1437,182 @@
+ NVACCEL_CNT(nvaccel_iop_async_refused, gCntIopAsyncRefused, "async swaps NVKMS refused (that frame stayed off the panel)");
+ NVACCEL_CNT(nvaccel_iop_async_drop,    gCntIopAsyncDrop,    "frames dropped because a flip was still in flight (never expected)");
+ static int gCrcHead = 0;
++static int gDbFastCopy = 1;
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_dbuf_fastcopy, CTLFLAG_RW | CTLFLAG_LOCKED, &gDbFastCopy, 0,
++           "Y540: 1 = the dbuf copy reads system memory as plain memory, 4 words at a time (0 = the old volatile per-word loop)");
++// y540 dbearly: a dbuf transaction completed only after its worker had synced the frame to system memory, copied it and
++// committed the flip (about 3-5 ms), and CoreDisplay starts the next frame only after that, so a 6 ms window-drag frame
++// landed every second vblank. With this on, the worker completes a transaction as soon as it takes the frame; the sync,
++// copy and flip follow. A frame that arrives meanwhile waits in a one-frame slot and its transaction completes when the
++// worker takes it, after the previous copy is done - CoreDisplay reuses a frame's surface only after the next frame's
++// transaction completes, so a surface is never overwritten while it is being copied.
++static int gDbEarly = 0;
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_dbuf_early, CTLFLAG_RW | CTLFLAG_LOCKED, &gDbEarly, 0,
++           "Y540: 1 = a dbuf transaction completes when the worker takes the frame (sync, copy and flip follow); 0 = after the flip");
++// y540 dbpar: the per-head dbuf workers were thread calls of the HIGH group, which runs its callouts mostly in series. With
++// zflip mode 1 a worker sleeps until its flip latches (up to a vblank), so with two displays the internal panel's frame
++// often waited behind the 60 Hz external head's latch wait: 120 Hz frames came 17-20 ms apart, and 34 ms apart for about a
++// third of every second, where the two heads' vblanks beat against each other. With debug.nvaccel_dbuf_tcpar=1 the
++// workers are thread calls of the KERNEL group (priority 81, above WindowServer's 79), which starts another thread when one
++// blocks, so each head waits only for its own latch. 0 = the HIGH group as before.
++static int gDbPar = 1;
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_dbuf_tcpar, CTLFLAG_RW | CTLFLAG_LOCKED, &gDbPar, 0,
++           "Y540: 1 = each head's dbuf worker is a KERNEL-group thread call (heads do not wait for each other); 0 = HIGH group");
++static volatile SInt64 gCntDbQdUs[2], gCntDbQdMaxUs[2], gCntDbQdLate[2], gCntDbQdN[2];
++NVACCEL_CNT(nvaccel_dbuf_qd_us_h0,     gCntDbQdUs[0],     "Y540 dbpar: total us from handing head 0's frame to its worker to the worker starting");
++NVACCEL_CNT(nvaccel_dbuf_qd_us_h1,     gCntDbQdUs[1],     "Y540 dbpar: the same for head 1");
++NVACCEL_CNT(nvaccel_dbuf_qd_max_us_h0, gCntDbQdMaxUs[0],  "Y540 dbpar: the longest such delay on head 0, us");
++NVACCEL_CNT(nvaccel_dbuf_qd_max_us_h1, gCntDbQdMaxUs[1],  "Y540 dbpar: the longest such delay on head 1, us");
++NVACCEL_CNT(nvaccel_dbuf_qd_late_h0,   gCntDbQdLate[0],   "Y540 dbpar: head 0 frames whose worker started more than 2 ms late");
++NVACCEL_CNT(nvaccel_dbuf_qd_late_h1,   gCntDbQdLate[1],   "Y540 dbpar: head 1 frames whose worker started more than 2 ms late");
++NVACCEL_CNT(nvaccel_dbuf_qd_n_h0,      gCntDbQdN[0],      "Y540 dbpar: head 0 frames timed");
++NVACCEL_CNT(nvaccel_dbuf_qd_n_h1,      gCntDbQdN[1],      "Y540 dbpar: head 1 frames timed");
++// y540 msr: read-only look at the power and turbo MSRs (the CPU runs flat at ratio 37, 3.7 GHz, at any load). Only the
++// listed addresses can be read, all architectural on Coffee Lake-H; nothing is written.
++static int gMsrAddr = 0x1AD;
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_msr_addr, CTLFLAG_RW | CTLFLAG_LOCKED, &gMsrAddr, 0, "Y540: which MSR debug.nvaccel_msr reads (power/turbo MSRs only)");
++static bool nvMsrAllowed(unsigned m)
++{
++    switch (m) {
++    case 0xCE: case 0xE2: case 0x194: case 0x198: case 0x199: case 0x19C: case 0x1A0: case 0x1A2: case 0x1AD: case 0x1B1:
++    case 0x606: case 0x610: case 0x611: case 0x638: case 0x640: case 0x648: case 0x649: case 0x64A: case 0x64B: case 0x64C:
++    case 0x64F: case 0x770: case 0x771: case 0x774:
++    case 0x1FC: case 0x65C: case 0x601: case 0x620: case 0x1B0: case 0x6B1: return true;
++    default: return false;
++    }
++}
++static int nvaccel_msr_sysctl SYSCTL_HANDLER_ARGS
++{
++    unsigned long long v = ~0ull; const unsigned m = (unsigned)gMsrAddr;
++    if (nvMsrAllowed(m)) { unsigned lo = 0, hi = 0; __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(m)); v = ((unsigned long long)hi << 32) | lo; }
++    return sysctl_handle_quad(oidp, &v, 0, req);
++}
++SYSCTL_PROC(_debug, OID_AUTO, nvaccel_msr, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, nvaccel_msr_sysctl, "Q",
++            "Y540: value of MSR debug.nvaccel_msr_addr on the CPU that answers (~0 = not on the list)");
++// y540 ocmb: the overclocking mailbox (MSR 0x150), the interface ThrottleStop and intel-undervolt use. Turbo ratio limits
++// (0x1AD 45..40), the HWP request (max/desired 45) and every limit-reason bit say 4.5 GHz is allowed, yet the core runs
++// flat at ratio 37; a firmware max-ratio override in the core's V/F settings would do exactly that. Only two commands
++// are issued: 0x10 (read the core domain's V/F settings) and, on an explicit write of debug.nvaccel_oc_maxratio, 0x11
++// with the same voltage fields and only bits 7:0 (max ratio, 0 = fused default) changed. Nothing runs at load.
++static unsigned long long gOcRaw = ~0ull;
++static inline unsigned long long nvRd(unsigned m) { unsigned lo = 0, hi = 0; __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(m)); return ((unsigned long long)hi << 32) | lo; }
++static inline void nvWr(unsigned m, unsigned long long v) { __asm__ volatile("wrmsr" : : "c"(m), "a"((unsigned)v), "d"((unsigned)(v >> 32))); }
++static bool nvOcMailbox(unsigned cmd, unsigned domain, unsigned data, unsigned long long *reply)
++{
++    nvWr(0x150, (1ull << 63) | ((unsigned long long)(domain & 7) << 40) | ((unsigned long long)(cmd & 0xff) << 32) | data);
++    unsigned long long r = 0;
++    for (unsigned i = 0; i < 1000; i++) { r = nvRd(0x150); if (!(r >> 63)) break; IODelay(1); }
++    gOcRaw = r; if (reply) *reply = r;
++    return !(r >> 63) && ((r >> 32) & 0xff) == 0;
++}
++static int nvaccel_oc_sysctl SYSCTL_HANDLER_ARGS
++{
++    unsigned long long r = 0;
++    int cur = nvOcMailbox(0x10, 0, 0, &r) ? (int)(r & 0xff) : -1;
++    const unsigned keep = (unsigned)r & ~0xffu;
++    int v = cur;
++    int err = sysctl_handle_int(oidp, &v, 0, req);
++    if (err || req->newptr == 0) return err;
++    if (cur < 0 || v < 0 || v > 45) return EINVAL;
++    unsigned long long w = 0;
++    const bool ok = nvOcMailbox(0x11, 0, keep | (unsigned)v, &w);
++    ALOG("ocmb: core max ratio %d -> %d (%s, reply 0x%llx)", cur, v, ok ? "accepted" : "REFUSED", w);
++    return ok ? 0 : EIO;
++}
++SYSCTL_PROC(_debug, OID_AUTO, nvaccel_oc_maxratio, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, nvaccel_oc_sysctl, "I",
++            "Y540: core max ratio in the OC mailbox V/F settings (0 = fused default, -1 = mailbox refused the read)");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_oc_raw, CTLFLAG_RD | CTLFLAG_LOCKED, &gOcRaw, "Y540: last raw OC mailbox reply");
++// y540 eet: MSR_POWER_CTL (0x1FC) bit 19 disables Energy Efficient Turbo, which lets the core settle below the requested
++// turbo ratio when it judges the gain small. Read-modify-write of that one bit on an explicit write only (resets at boot).
++static int nvaccel_eet_sysctl SYSCTL_HANDLER_ARGS
++{
++    const unsigned long long cur = nvRd(0x1FC);
++    int v = (int)((cur >> 19) & 1);
++    int err = sysctl_handle_int(oidp, &v, 0, req);
++    if (err || req->newptr == 0) return err;
++    const unsigned long long nv = v ? (cur | (1ull << 19)) : (cur & ~(1ull << 19));
++    nvWr(0x1FC, nv);
++    ALOG("eet: POWER_CTL 0x%llx -> 0x%llx (read back 0x%llx)", cur, nv, nvRd(0x1FC));
++    return 0;
++}
++SYSCTL_PROC(_debug, OID_AUTO, nvaccel_eet_disable, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, nvaccel_eet_sysctl, "I",
++            "Y540: MSR_POWER_CTL bit 19 (1 = Energy Efficient Turbo disabled)");
++static void nvAccelDbReset(void);
++static int nvaccel_dbuf_sysctl SYSCTL_HANDLER_ARGS
++{
++    int v = gIopDbuf;
++    int err = sysctl_handle_int(oidp, &v, 0, req);
++    if (err || req->newptr == 0) return err;
++    nvAccelDbReset();   // a write also clears the per-head "flips stopped working" and allocation-failure latches
++    gIopDbuf = v < 0 ? 0 : v > 2 ? 2 : v;
++    ALOG("dbuf: debug.nvaccel_iop_dbuf=%d", gIopDbuf);
++    return 0;
++}
++SYSCTL_PROC(_debug, OID_AUTO, nvaccel_iop_dbuf, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, nvaccel_dbuf_sysctl, "I",
++            "Y540: 1 = copied frames go to two VRAM buffers per head (2 = three) and reach the panel by vsync-latched flips "
++            "(no tearing), copied on a per-head thread call; 0 = copy into the live boot scanout on the display pipe's work loop");
++NVACCEL_CNT(nvaccel_dbuf_frames,      gCntDbFrames,        "Y540 dbuf: frames put on a panel by a flip");
++NVACCEL_CNT(nvaccel_dbuf_frames_h0,   gCntDbFramesHead[0], "Y540 dbuf: of those, head 0");
++NVACCEL_CNT(nvaccel_dbuf_frames_h1,   gCntDbFramesHead[1], "Y540 dbuf: of those, head 1");
++NVACCEL_CNT(nvaccel_dbuf_flip_fail,   gCntDbFlipFail,      "Y540 dbuf: flips NVRMFB refused (that frame stayed off the panel)");
++NVACCEL_CNT(nvaccel_dbuf_alloc_fail,  gCntDbAllocFail,     "Y540 dbuf: buffer grants refused (that head copies into the boot scanout)");
++NVACCEL_CNT(nvaccel_dbuf_latch_to,    gCntDbLatchTimeout,  "Y540 dbuf: flips that did not latch within 100 ms (that head stops flipping)");
++NVACCEL_CNT(nvaccel_dbuf_direct,      gCntDbDirect,        "Y540 dbuf: frames copied straight onto the panel (flips stopped working)");
++NVACCEL_CNT(nvaccel_dbuf_wait_us,     gCntDbWaitUs,        "Y540 dbuf: total us waiting for the previous flip to latch");
++NVACCEL_CNT(nvaccel_dbuf_sync_us,     gCntDbSyncUs,        "Y540 dbuf: total us bringing frames to system memory");
++NVACCEL_CNT(nvaccel_dbuf_copy_us,     gCntDbCopyUs,        "Y540 dbuf: total us copying and narrowing frames into VRAM");
++NVACCEL_CNT(nvaccel_dbuf_copy_max_us, gCntDbCopyMaxUs,     "Y540 dbuf: the slowest frame copy, us");
++NVACCEL_CNT(nvaccel_dbuf_flip_us,     gCntDbFlipUs,        "Y540 dbuf: total us committing flips");
++NVACCEL_CNT(nvaccel_dbuf_sync_retry,  gCntDbSyncRetry,     "Y540 dbuf: sync retries because the accelerator lock was busy");
++NVACCEL_CNT(nvaccel_dbuf_busy,        gCntDbBusy,          "Y540 dbuf: transactions that found the head's worker still busy (never expected)");
++NVACCEL_CNT(nvaccel_dbuf_early_n,     gCntDbEarly,         "Y540 dbearly: transactions completed when the worker took the frame");
++NVACCEL_CNT(nvaccel_dbuf_pend_n,      gCntDbPend,          "Y540 dbearly: frames that waited behind the worker's current one");
++NVACCEL_CNT(nvaccel_dbuf_home,        gCntDbHome,          "Y540 dbuf: flips back to the boot scanout");
++NVACCEL_CNT(nvaccel_iop_perf_us,      gCntPerfUs,          "Y540: total us performTransaction spent per handled frame (the family's gated path)");
++NVACCEL_CNT(nvaccel_iop_perf_n,       gCntPerfN,           "Y540: frames timed in nvaccel_iop_perf_us");
++NVACCEL_CNT(nvaccel_iop_perf_max_us,  gCntPerfMaxUs,       "Y540: the slowest of them, us");
++static int nvaccel_zflip_sysctl SYSCTL_HANDLER_ARGS
++{
++    int v = gZflip;
++    int err = sysctl_handle_int(oidp, &v, 0, req);
++    if (err || req->newptr == 0) return err;
++    gZflip = v < 0 ? 0 : v > 3 ? 3 : v;
++    ALOG("zflip: debug.nvaccel_zflip=%d", gZflip);
++    return 0;
++}
++SYSCTL_PROC(_debug, OID_AUTO, nvaccel_zflip, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, nvaccel_zflip_sysctl, "I",
++            "Y540: 1 = frames whose newest pixels are in their IOSurface's VRAM are flipped to directly (l10r as X2B10G10R10 "
++            "with R/B swapped), transaction completed at the latch; 2 = the same, completed at the commit; 3 = completed at the "
++            "commit, and the WindowServer plugin waits for a screen surface to leave the panel before drawing into it (zgate); "
++            "0 = always copy");
++NVACCEL_CNT(nvaccel_zflip_frames,     gCntZcFrames,        "Y540 zflip: frames scanned out of their own VRAM");
++NVACCEL_CNT(nvaccel_zflip_refused,    gCntZcRefused,       "Y540 zflip: direct flips NVRMFB refused (that frame was copied)");
++NVACCEL_CNT(nvaccel_zflip_no_fmt,     gCntZcNo[0],         "Y540 zflip: copied - not BGRA or l10r");
++NVACCEL_CNT(nvaccel_zflip_no_vram,    gCntZcNo[1],         "Y540 zflip: copied - no RM VRAM (or the accelerator lock was busy)");
++NVACCEL_CNT(nvaccel_zflip_no_newest,  gCntZcNo[2],         "Y540 zflip: copied - VRAM does not hold the newest pixels");
++NVACCEL_CNT(nvaccel_zflip_no_geom,    gCntZcNo[3],         "Y540 zflip: copied - geometry does not fit the allocation");
++NVACCEL_CNT(nvaccel_zflip_no_ret,     gCntZcNo[4],         "Y540 zflip: copied - the newest pixels are in a retired or evicted allocation");
++NVACCEL_CNT(nvaccel_zflip_gpu_us,     gCntZcGpuUs,         "Y540 zflip: total us waiting for the frame's GPU work");
++NVACCEL_CNT(nvaccel_zflip_gpu_max_us, gCntZcGpuMaxUs,      "Y540 zflip: the longest such wait, us");
++NVACCEL_CNT(nvaccel_zflip_latch_us,   gCntZcLatchUs,       "Y540 zflip: total us waiting for flips to latch");
++NVACCEL_CNT(nvaccel_zflip_txn_us,     gCntZcTxnUs,         "Y540 zflip: total us from the worker taking a frame to completing its transaction");
++NVACCEL_CNT(nvaccel_zflip_txn_max_us, gCntZcTxnMaxUs,      "Y540 zflip: the longest of those, us");
++static SInt64 gCntZgAsks, gCntZgWaits, gCntZgUs, gCntZgMaxUs, gCntZgTimeouts;
++NVACCEL_CNT(nvaccel_zgate_asks,       gCntZgAsks,          "Y540 zgate: WindowServer asked before drawing into a screen surface");
++NVACCEL_CNT(nvaccel_zgate_waits,      gCntZgWaits,         "Y540 zgate: of those, the surface was still on a panel (the flip replacing it had not latched)");
++NVACCEL_CNT(nvaccel_zgate_us,         gCntZgUs,            "Y540 zgate: total us those waits took");
++NVACCEL_CNT(nvaccel_zgate_max_us,     gCntZgMaxUs,         "Y540 zgate: the longest wait, us");
++NVACCEL_CNT(nvaccel_zgate_timeouts,   gCntZgTimeouts,      "Y540 zgate: waits that gave up (the replacing flip did not latch in time)");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_ws_async, CTLFLAG_RW | CTLFLAG_LOCKED, &gWsAsync, 0,
++           "Y540: 1 = the WindowServer plugin may mark a screen surface's GPU writes in flight instead of waiting for them; "
++           "the display path waits (no lock held). The plugin uses it only while debug.nvaccel_iop_dbuf is on");
++NVACCEL_CNT(nvaccel_infl_set,         gCntInflSet,         "Y540 ws-async: surfaces marked GPU-write-in-flight");
++NVACCEL_CNT(nvaccel_infl_clear,       gCntInflClear,       "Y540 ws-async: in-flight marks cleared by the plugin");
++NVACCEL_CNT(nvaccel_infl_full,        gCntInflFull,        "Y540 ws-async: marks refused, table full (the plugin waits itself)");
++NVACCEL_CNT(nvaccel_infl_waits,       gCntInflWaits,       "Y540 ws-async: display syncs that waited for a GPU write");
++NVACCEL_CNT(nvaccel_infl_wait_us,     gCntInflWaitUs,      "Y540 ws-async: total us of those waits");
++NVACCEL_CNT(nvaccel_infl_wait_max_us, gCntInflWaitMaxUs,   "Y540 ws-async: the longest, us");
++NVACCEL_CNT(nvaccel_infl_timeouts,    gCntInflTimeouts,    "Y540 ws-async: waits given up after 100 ms (mark dropped)");
+ SYSCTL_INT(_debug, OID_AUTO, nvaccel_crc_head, CTLFLAG_RW | CTLFLAG_LOCKED, &gCrcHead, 0, "b85k-crc: which head debug.nvaccel_crc reads");
+ static int nvaccel_crc_sysctl SYSCTL_HANDLER_ARGS;
+ SYSCTL_PROC(_debug, OID_AUTO, nvaccel_crc, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, nvaccel_crc_sysctl, "I",
+@@ -1014,6 +1623,14 @@
+     if (gSysctlInstalled) return;
+     sysctl_register_oid(&sysctl__debug_nvaccelfb);
+     sysctl_register_oid(&sysctl__debug_nvaccel_headless);
++    sysctl_register_oid(&sysctl__debug_nvaccel_lazy_family_maps);
++    sysctl_register_oid(&sysctl__debug_nvaccel_lazy_maps); sysctl_register_oid(&sysctl__debug_nvaccel_lazy_map_bytes); sysctl_register_oid(&sysctl__debug_nvaccel_lazy_map_fails);
++    sysctl_register_oid(&sysctl__debug_nvaccel_ap_release);  sysctl_register_oid(&sysctl__debug_nvaccel_ap_released);
++    sysctl_register_oid(&sysctl__debug_nvaccel_ap_released_bytes); sysctl_register_oid(&sysctl__debug_nvaccel_ap_kept);
++    sysctl_register_oid(&sysctl__debug_nvaccel_ap_rebuilt); sysctl_register_oid(&sysctl__debug_nvaccel_ap_busy);
++    sysctl_register_oid(&sysctl__debug_nvaccel_cpu_touch); sysctl_register_oid(&sysctl__debug_nvaccel_cpu_touch_bytes);
++    sysctl_register_oid(&sysctl__debug_nvaccel_cpu_touch_live); sysctl_register_oid(&sysctl__debug_nvaccel_kva_touch);
++    sysctl_register_oid(&sysctl__debug_nvaccel_kva_touch_bytes); sysctl_register_oid(&sysctl__debug_nvaccel_kva_touch_live);
+     sysctl_register_oid(&sysctl__debug_nvaccel_vm_alloc);       sysctl_register_oid(&sysctl__debug_nvaccel_vm_alloc_bytes);
+     sysctl_register_oid(&sysctl__debug_nvaccel_vm_dealloc);     sysctl_register_oid(&sysctl__debug_nvaccel_vm_dealloc_bytes);
+     sysctl_register_oid(&sysctl__debug_nvaccel_vm_refused);
+@@ -1025,6 +1642,19 @@
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_empty);
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_res);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_surf);
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_blank);
++    sysctl_register_oid(&sysctl__debug_nvaccel_iop_forcesync);  sysctl_register_oid(&sysctl__debug_nvaccel_iop_holdblank);
++    sysctl_register_oid(&sysctl__debug_nvaccel_boothold); sysctl_register_oid(&sysctl__debug_nvaccel_boothold_ms);
++    sysctl_register_oid(&sysctl__debug_nvaccel_boothold_held);
++    sysctl_register_oid(&sysctl__debug_nvaccel_framediag);
++    sysctl_register_oid(&sysctl__debug_nvaccel_iop_forced);     sysctl_register_oid(&sysctl__debug_nvaccel_iop_held);
++    sysctl_register_oid(&sysctl__debug_nvaccel_famdiag);        sysctl_register_oid(&sysctl__debug_nvaccel_deepblank);
++    sysctl_register_oid(&sysctl__debug_nvaccel_deepgood);       sysctl_register_oid(&sysctl__debug_nvaccel_surfledger);
++    sysctl_register_oid(&sysctl__debug_nvaccel_vm_reback);      sysctl_register_oid(&sysctl__debug_nvaccel_stale_dirty);
++    sysctl_register_oid(&sysctl__debug_nvaccel_stale_pageoff);
++    sysctl_register_oid(&sysctl__debug_nvaccel_vm_retired);     sysctl_register_oid(&sysctl__debug_nvaccel_vm_retired_freed);
++    sysctl_register_oid(&sysctl__debug_nvaccel_vm_retired_live); sysctl_register_oid(&sysctl__debug_nvaccel_ret_pageoff);
++    sysctl_register_oid(&sysctl__debug_nvaccel_ret_reused);
++    sysctl_register_oid(&sysctl__debug_nvaccel_dirty_reback);   sysctl_register_oid(&sysctl__debug_nvaccel_dirty_reback_fail);
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip);       sysctl_register_oid(&sysctl__debug_nvaccel_iop_flips);
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_home);  sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_lock);
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_novram); sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_stale);
+@@ -1038,6 +1668,44 @@
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h4);      sysctl_register_oid(&sysctl__debug_nvaccel_igpu);
+     sysctl_register_oid(&sysctl__debug_nvaccel_heads_published); sysctl_register_oid(&sysctl__debug_nvaccel_heads_registered);
+     sysctl_register_oid(&sysctl__debug_nvaccel_heads_piped);
++    sysctl_register_oid(&sysctl__debug_nvaccel_iop_dbuf);
++    sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_fastcopy);
++    sysctl_register_oid(&sysctl__debug_nvaccel_msr_addr);      sysctl_register_oid(&sysctl__debug_nvaccel_msr);
++    sysctl_register_oid(&sysctl__debug_nvaccel_oc_maxratio);   sysctl_register_oid(&sysctl__debug_nvaccel_oc_raw);
++    sysctl_register_oid(&sysctl__debug_nvaccel_eet_disable);
++    sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_frames);     sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_frames_h0);
++    sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_frames_h1);  sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_flip_fail);
++    sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_alloc_fail); sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_latch_to);
++    sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_direct);     sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_wait_us);
++    sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_sync_us);    sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_copy_us);
++    sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_copy_max_us); sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_flip_us);
++    sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_sync_retry); sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_busy);
++    sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_early);      sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_early_n);
++    sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_pend_n);
++    sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_home);
++    sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_tcpar);
++    sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_qd_us_h0);     sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_qd_us_h1);
++    sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_qd_max_us_h0); sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_qd_max_us_h1);
++    sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_qd_late_h0);   sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_qd_late_h1);
++    sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_qd_n_h0);      sysctl_register_oid(&sysctl__debug_nvaccel_dbuf_qd_n_h1);
++    sysctl_register_oid(&sysctl__debug_nvaccel_iop_perf_us);     sysctl_register_oid(&sysctl__debug_nvaccel_iop_perf_n);
++    sysctl_register_oid(&sysctl__debug_nvaccel_iop_perf_max_us);
++    sysctl_register_oid(&sysctl__debug_nvaccel_zflip);            sysctl_register_oid(&sysctl__debug_nvaccel_zflip_frames);
++    sysctl_register_oid(&sysctl__debug_nvaccel_zflip_refused);    sysctl_register_oid(&sysctl__debug_nvaccel_zflip_no_fmt);
++    sysctl_register_oid(&sysctl__debug_nvaccel_zflip_no_vram);    sysctl_register_oid(&sysctl__debug_nvaccel_zflip_no_newest);
++    sysctl_register_oid(&sysctl__debug_nvaccel_zflip_no_geom);    sysctl_register_oid(&sysctl__debug_nvaccel_zflip_no_ret);
++    sysctl_register_oid(&sysctl__debug_nvaccel_zflip_gpu_us);     sysctl_register_oid(&sysctl__debug_nvaccel_zflip_gpu_max_us);
++    sysctl_register_oid(&sysctl__debug_nvaccel_zflip_latch_us);   sysctl_register_oid(&sysctl__debug_nvaccel_zflip_txn_us);
++    sysctl_register_oid(&sysctl__debug_nvaccel_zflip_txn_max_us);
++    sysctl_register_oid(&sysctl__debug_nvaccel_zgate_asks);   sysctl_register_oid(&sysctl__debug_nvaccel_zgate_waits);
++    sysctl_register_oid(&sysctl__debug_nvaccel_zgate_us);     sysctl_register_oid(&sysctl__debug_nvaccel_zgate_max_us);
++    sysctl_register_oid(&sysctl__debug_nvaccel_zgate_timeouts);
++    sysctl_register_oid(&sysctl__debug_nvaccel_ws_async);
++    sysctl_register_oid(&sysctl__debug_nvaccel_infl_set);        sysctl_register_oid(&sysctl__debug_nvaccel_infl_clear);
++    sysctl_register_oid(&sysctl__debug_nvaccel_infl_full);       sysctl_register_oid(&sysctl__debug_nvaccel_infl_waits);
++    sysctl_register_oid(&sysctl__debug_nvaccel_infl_wait_us);    sysctl_register_oid(&sysctl__debug_nvaccel_infl_wait_max_us);
++    sysctl_register_oid(&sysctl__debug_nvaccel_infl_timeouts);
++    { int dv = 0; if (PE_parse_boot_argn("nvdbuf", &dv, sizeof dv)) { gIopDbuf = dv < 0 ? 0 : dv > 2 ? 2 : dv; ALOG("dbuf: boot-arg nvdbuf=%d", dv); } }
+     gSysctlInstalled = true;
+     ALOG("sysctl debug.nvaccelfb installed -- `sudo sysctl -w debug.nvaccelfb=1` registers the framebuffer");
+ }
+@@ -1162,6 +1830,201 @@
+     IOSimpleLockUnlock(gNVSVPendLock);
+     return r;
+ }
++
++// ---- Y540 ws-async: GPU writes still in flight, per IOSurface ---------------------------------------------------------
++// WindowServer's compositor waited in commitAndWaitUntilSubmitted until the GPU had finished every command buffer that drew
++// into a screen-sized surface: about 4 ms of a 16 ms window-drag frame on its main thread, only so the display path would
++// never copy a half-drawn frame. With debug.nvaccel_ws_async the plugin marks such a surface here before it commits
++// (surface-dirty escape, plane | 0x80000000) and clears the mark once the GPU is done and the usual dirty mark is made
++// (plane | 0xC0000000). The display sync (nvAccelSurfScanoutSync) waits for the clear, holding no lock.
++#ifndef THREAD_UNINT
++#define THREAD_UNINT 0
++#endif
++#ifndef THREAD_TIMED_OUT
++#define THREAD_TIMED_OUT 1
++#endif
++enum { kNVSVInfl = 32 };
++static unsigned gNVSVInflId[kNVSVInfl];
++static uint64_t gNVSVInflSince[kNVSVInfl];
++static IOLock *volatile gNVSVInflLock;
++static IOLock *nvSVInflLock(void)
++{
++    if (!gNVSVInflLock) { IOLock *l = IOLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gNVSVInflLock)) IOLockFree(l); }
++    return gNVSVInflLock;
++}
++static bool nvSVInflight(unsigned id, bool set)
++{
++    IOLock *l = id ? nvSVInflLock() : nullptr;
++    if (!l) return false;
++    bool ok = true;
++    IOLockLock(l);
++    int at = -1, freeSlot = -1;
++    for (int i = 0; i < kNVSVInfl; i++) {
++        if (gNVSVInflId[i] == id) { at = i; break; }
++        if (!gNVSVInflId[i] && freeSlot < 0) freeSlot = i;
++    }
++    if (set) {
++        const uint64_t now = mach_absolute_time();
++        if (at < 0) at = freeSlot;
++        if (at < 0)   // a mark older than a second belongs to a client that died before clearing it
++            for (int i = 0; i < kNVSVInfl; i++) if (now - gNVSVInflSince[i] > 1000000000ull) { at = i; break; }
++        if (at >= 0) { gNVSVInflId[at] = id; gNVSVInflSince[at] = now; OSAddAtomic64(1, &gCntInflSet); }
++        else { ok = false; OSAddAtomic64(1, &gCntInflFull); }
++    } else {
++        if (at >= 0) gNVSVInflId[at] = 0;
++        OSAddAtomic64(1, &gCntInflClear);
++        IOLockWakeup(l, (void *)gNVSVInflId, false);
++    }
++    IOLockUnlock(l);
++    return ok;
++}
++static void nvSVInflightWait(unsigned id, unsigned maxMs)
++{
++    IOLock *l = gNVSVInflLock;
++    if (!id || !l) return;
++    const uint64_t t0 = mach_absolute_time(), deadline = t0 + (uint64_t)maxMs * 1000000ull;   // x86: absolute time is ns
++    bool waited = false, timedOut = false;
++    IOLockLock(l);
++    for (;;) {
++        int at = -1;
++        for (int i = 0; i < kNVSVInfl; i++) if (gNVSVInflId[i] == id) { at = i; break; }
++        if (at < 0) break;
++        waited = true;
++        if (mach_absolute_time() >= deadline) { gNVSVInflId[at] = 0; timedOut = true; break; }
++        IOLockSleepDeadline(l, (void *)gNVSVInflId, deadline, THREAD_UNINT);
++    }
++    IOLockUnlock(l);
++    if (!waited) return;
++    const SInt64 us = (SInt64)((mach_absolute_time() - t0) / 1000);
++    OSAddAtomic64(1, &gCntInflWaits); OSAddAtomic64(us, &gCntInflWaitUs);
++    if (us > gCntInflWaitMaxUs) gCntInflWaitMaxUs = us;
++    if (timedOut) {
++        const SInt64 n = OSAddAtomic64(1, &gCntInflTimeouts) + 1;
++        if (n <= 8 || (n & 1023) == 0) ALOG("ws-async: surface %u still had a GPU write in flight after %u ms -- syncing anyway (%lld so far)", id, maxMs, (long long)n);
++    }
++}
++
++// ---- Y540 per-surface ledger -------------------------------------------------------------------------------------------
++#include <mach/mach_time.h>
++#include <sys/proc.h>
++struct NVSurfStat {
++    unsigned id, surf, incarn, lastMs;
++    unsigned sh, shFail, shPid, shMs, shVm, shRm, shBytes, shStatus;
++    unsigned dirty, dirtyRef, dirtyPid, dirtyFirstMs;
++    unsigned ceOk, ceFail, ceVm, ceRm, ceLastMs;
++    unsigned fam[8], famPid, famLastMs;
++    unsigned frames, blank, head, frFirstMs, frLastMs, frVm, w, h;
++};
++enum { kNVSS = 160 };
++static NVSurfStat gSS[kNVSS];
++static IOSimpleLock *volatile gSSLock;
++static SInt64 gCntFamOp[8];
++static inline unsigned nvSSNowMs(void) { return (unsigned)(mach_absolute_time() / 1000000ull); }
++static inline unsigned nvLo(const void *p) { return (unsigned)((uintptr_t)p & 0xffffffffu); }
++static IOSimpleLock *nvSSLock(void)
++{
++    if (!gSSLock) {
++        IOSimpleLock *l = IOSimpleLockAlloc();
++        if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gSSLock)) IOSimpleLockFree(l);
++    }
++    return gSSLock;
++}
++// caller holds gSSLock; a different IOSurface object under a reused ID starts a new incarnation of the entry
++static NVSurfStat *nvSSGet(unsigned id, unsigned surfLo)
++{
++    if (!id) return nullptr;
++    int freeI = -1, oldI = 0; unsigned oldT = 0xffffffffu;
++    for (int i = 0; i < kNVSS; i++) {
++        NVSurfStat *e = &gSS[i];
++        if (e->id == id) {
++            if (surfLo && e->surf && e->surf != surfLo) {
++                const unsigned inc = e->incarn + 1;
++                for (unsigned k = 0; k < sizeof *e; k++) ((volatile unsigned char *)e)[k] = 0;
++                e->id = id; e->incarn = inc;
++            }
++            if (surfLo) e->surf = surfLo;
++            return e;
++        }
++        if (!e->id) { if (freeI < 0) freeI = i; }
++        else if (e->lastMs < oldT) { oldT = e->lastMs; oldI = i; }
++    }
++    NVSurfStat *e = &gSS[freeI >= 0 ? freeI : oldI];
++    for (unsigned k = 0; k < sizeof *e; k++) ((volatile unsigned char *)e)[k] = 0;
++    e->id = id; e->surf = surfLo;
++    return e;
++}
++#define NVSS_DO(id_, surf_, ...) do { IOSimpleLock *l_ = nvSSLock(); const unsigned now_ = nvSSNowMs(); (void)now_; \
++    if (l_) { IOSimpleLockLock(l_); NVSurfStat *e = nvSSGet((id_), nvLo(surf_)); if (e) { e->lastMs = now_; __VA_ARGS__; } IOSimpleLockUnlock(l_); } } while (0)
++
++static void nvSSFrame(IOSurface *s, unsigned head, bool blank, unsigned w, unsigned h, unsigned vmLo)
++{
++    NVSS_DO(_ZNK9IOSurface12getSurfaceIDEv((void *)s), s, {
++        if (!e->frames) e->frFirstMs = now_;
++        e->frames++; if (blank) e->blank++; e->head = head; e->frLastMs = now_; e->w = w; e->h = h;
++        if (vmLo) e->frVm = vmLo; });
++}
++
++static const char *const kFamOpName[8] = { "pageon", "pageon/3", "pageoff/3", "pageonIfNeeded", "pageoffIfNeeded",
++                                           "zeroVidMemory", "pageoff/4-family", "rebuildPagingBuffer" };
++void nvFamNote(IOAccelResource2 *res, int op, int phase)
++{
++    if (!res || op < 0 || op > 7) return;
++    volatile unsigned char *r = (volatile unsigned char *)res;
++    const unsigned type = r[0x14];
++    void *cache = (type == 0xc0) ? *(void *volatile *)(r + 0xe0) : nullptr;
++    void *surf = cache ? *(void *volatile *)((unsigned char *)cache + 0x10) : nullptr;
++    const unsigned id = surf ? _ZNK9IOSurface12getSurfaceIDEv(surf) : 0;
++    volatile unsigned short *valid = (type == 0xc0) ? *(unsigned short *volatile *)(r + 0x30) : nullptr;
++    NVVidMemory *vm = nvres_vidmem(res);
++    const int pid = proc_selfpid();
++    if (!phase) {
++        OSAddAtomic64(1, &gCntFamOp[op]);
++        if (op == 4 && vm) vm->fEvictHint = true;   // the family pages a resource off before it evicts it
++        if (id) NVSS_DO(id, surf, { e->fam[op]++; e->famPid = (unsigned)pid; e->famLastMs = now_; });
++    }
++    if (op != 7 && gFamDiag > 0) {
++        OSDecrementAtomic((volatile SInt32 *)&gFamDiag);
++        ALOG("FAMDIAG %s %s surf %u pid %d type 0x%x v0 0x%x v6 0x%x vm %08x rm %08x bytes %llu lazy %d kva %d", kFamOpName[op],
++             phase ? "after " : "before", id, pid, type, valid ? valid[0] : 0xffffu, valid ? valid[6] : 0xffffu, nvLo(vm),
++             vm ? nvLo(vm->fRmHandle) : 0u, vm ? vm->fBytes : 0ull, vm ? (int)vm->fLazy : -1, (vm && vm->fKva) ? 1 : 0);
++    }
++}
++
++static int nvsurfledger_sysctl SYSCTL_HANDLER_ARGS
++{
++    const unsigned cap = 64 * 1024;
++    char *buf = (char *)IOMalloc(cap);
++    NVSurfStat *snap = (NVSurfStat *)IOMalloc(sizeof gSS);
++    if (!buf || !snap) { if (buf) IOFree(buf, cap); if (snap) IOFree(snap, sizeof gSS); return ENOMEM; }
++    IOSimpleLock *l = nvSSLock();
++    if (l) IOSimpleLockLock(l);
++    for (unsigned k = 0; k < sizeof gSS; k++) ((volatile unsigned char *)snap)[k] = ((volatile unsigned char *)gSS)[k];
++    if (l) IOSimpleLockUnlock(l);
++    unsigned n = 0;
++#define NVSS_PUT(...) do { if (n < cap - 1) { int k_ = snprintf(buf + n, cap - n, __VA_ARGS__); if (k_ > 0) n += ((unsigned)k_ < cap - n) ? (unsigned)k_ : cap - n - 1; } } while (0)
++    NVSS_PUT("now %ums | family calls: pageon %lld pageon/3 %lld pageoff/3 %lld pageonIfNeeded %lld pageoffIfNeeded %lld zeroVidMemory %lld pageoff/4-family %lld rebuild %lld\n",
++             nvSSNowMs(), gCntFamOp[0], gCntFamOp[1], gCntFamOp[2], gCntFamOp[3], gCntFamOp[4], gCntFamOp[5], gCntFamOp[6], gCntFamOp[7]);
++    unsigned last = 0;
++    for (;;) {
++        int best = -1;
++        for (int i = 0; i < kNVSS; i++)
++            if (snap[i].id > last && (best < 0 || snap[i].id < snap[best].id)) best = i;
++        if (best < 0) break;
++        const NVSurfStat *e = &snap[best]; last = e->id;
++        NVSS_PUT("surf %u inc %u obj %08x | share %u fail %u st %#x pid %u @%u vm %08x rm %08x %uB | dirty %u ref %u pid %u first@%u"
++                 " | ce %u fail %u vm %08x rm %08x last@%u | fam on %u on3 %u off3 %u onIf %u offIf %u zero %u off4 %u pid %u last@%u"
++                 " | frames %u blank %u head %u %ux%u @%u..%u vm %08x\n",
++                 e->id, e->incarn, e->surf, e->sh, e->shFail, e->shStatus, e->shPid, e->shMs, e->shVm, e->shRm, e->shBytes,
++                 e->dirty, e->dirtyRef, e->dirtyPid, e->dirtyFirstMs, e->ceOk, e->ceFail, e->ceVm, e->ceRm, e->ceLastMs,
++                 e->fam[0], e->fam[1], e->fam[2], e->fam[3], e->fam[4], e->fam[5], e->fam[6], e->famPid, e->famLastMs,
++                 e->frames, e->blank, e->head, e->w, e->h, e->frFirstMs, e->frLastMs, e->frVm);
++    }
++#undef NVSS_PUT
++    const int err = SYSCTL_OUT(req, buf, n + 1);
++    IOFree(buf, cap); IOFree(snap, sizeof gSS);
++    return err;
++}
++// ------------------------------------------------------------------------------------------------------------------------
+ static void    *gNVSVRoot;
+ static unsigned gNVSVOk, gNVSVRefused;
+ static inline void nvSVZero(void *p, unsigned long n) { volatile unsigned char *b = (volatile unsigned char *)p; while (n--) *b++ = 0; }
+@@ -1181,10 +2044,20 @@
+     valid[0] &= (unsigned short)~(1u << plane);
+     return 0;
+ }
++static bool nvZcOffPanelWait(unsigned id, unsigned maxMs);   // y540 zgate
+ static IOReturn nvAccelSurfVram(struct NVRMSurfShareEsc *p, task_t task, unsigned cmd)
+ {
+     p->hSrcClient = p->hSrcMemory = 0;
+     if (p->version != NVRM_SURFSHARE_VERSION) { p->status = NVRM_SS_BAD_VERSION; return kIOReturnSuccess; }
++    if (cmd == NVRM_ESC_SURF_DIRTY && (p->plane & 0xE0000000u) == 0xA0000000u) {   // y540 zgate: wait until it is off every panel
++        p->status = nvZcOffPanelWait(p->surfaceID, 25) ? 0u : NVRM_SS_OFF;
++        return kIOReturnSuccess;
++    }
++    if (cmd == NVRM_ESC_SURF_DIRTY && (p->plane & 0x80000000u)) {   // ws-async in-flight mark (set) or its clear
++        const bool set = !(p->plane & 0x40000000u);
++        p->status = !set ? (nvSVInflight(p->surfaceID, false), 0u) : (gWsAsync && nvSVInflight(p->surfaceID, true)) ? 0u : NVRM_SS_OFF;
++        return kIOReturnSuccess;
++    }
+     NVAccel *a = NVAccel::gAccel;
+     struct NVRMRmHandles h; nvSVZero(&h, sizeof h);
+     if (!task || !a || !nvAccelRmHandles(&h)) { p->status = NVRM_SS_OFF; return kIOReturnSuccess; }
+@@ -1201,8 +2074,38 @@
+     NVResource *res = OSDynamicCast(NVResource, ctx);
+     NVVidMemory *vm = res ? nvres_vidmem(res) : nullptr;
+     if (cmd == NVRM_ESC_SURF_DIRTY) {
+-        p->status = (cache && res && vm && vm->fRmHandle) ? nvAccelSurfDirty(cache, res, p->plane) : NVRM_SS_NO_CACHE;
++        // y540 accdb9: a surface the family evicted and never paged back on stays unbacked while its Metal client keeps
++        // drawing into the retired VRAM. WindowServer's 1920x1080 compositing buffers after a display mode change are the
++        // case: only the plugin draws them and its GPU work never goes through the family's page-on, so every dirty mark
++        // was refused (NO_CACHE) and WindowServer copied 8 MB out per frame until it restarted. Back the surface again with
++        // that same retired VRAM (wire -> allocPhysical takes it back), so the mark is taken and nothing is copied.
++        if (vm && !vm->fRmHandle && !vm->fScanout && vm->fRetToken && vm->fRetGen == vm->fBackGen && p->surfaceID == vm->fImpSurf) {
++            bool mine = false;
++            for (int i = 0; i < 4; i++) if (p->hClient && vm->fImpClient[i] == p->hClient && vm->fImpGen[i] == vm->fRetGen) mine = true;
++            if (mine && nvRetGet(vm->fRetToken, nullptr, nullptr)) {
++                _ZN16IOAccelVidMemory4wireEv(vm);
++                const bool ok = vm->fRmHandle != nullptr;
++                const SInt64 nk = OSAddAtomic64(1, ok ? &gCntDirtyReback : &gCntDirtyRebackFail) + 1;
++                if (nk <= 24 || (nk & 1023) == 0)
++                    ALOG("surfvram dirty: surface %u was evicted and never paged back on while client %#x draws into its retired VRAM -- %s (%lld so far)",
++                         p->surfaceID, p->hClient, ok ? "backed again with that VRAM, mark taken" : "wire did not back it, refused", (long long)nk);
++            }
++        }
++        int ist = (vm && vm->fRmHandle) ? vm->importState(p->hClient, p->surfaceID) : 0;
++        if (ist == 1 && !nvRetGet(vm->fRetToken, nullptr, nullptr)) { vm->fRetToken = 0; ist = 2; }   // the table let it go
++        nvRetGC();
++        const bool stale = ist == 2;
++        if (stale) {
++            const SInt64 ns = OSAddAtomic64(1, &gCntStaleDirty) + 1;
++            if (ns <= 12 || (ns & 4095) == 0)
++                ALOG("surfvram dirty: surface %u client %#x drew into VRAM generation that was evicted (now %u) -- refused, the client copies its pixels out (%lld so far)",
++                     p->surfaceID, p->hClient, vm->fBackGen, (long long)ns);
++        }
++        if (!stale && vm && vm->fRmHandle) vm->fSrcRet = (ist == 1);
++        p->status = (!stale && cache && res && vm && vm->fRmHandle) ? nvAccelSurfDirty(cache, res, p->plane) : NVRM_SS_NO_CACHE;
+         if (p->status == 0) gNVSVDirty++; else gNVSVDirtyRefused++;
++        { const unsigned pid = (unsigned)proc_selfpid(); const bool okd = p->status == 0;
++          NVSS_DO(p->surfaceID, surf, { if (okd) { if (!e->dirty) e->dirtyFirstMs = now_; e->dirty++; } else e->dirtyRef++; e->dirtyPid = pid; }); }
+         if (gNVSVDirty + gNVSVDirtyRefused <= 6 || ((gNVSVDirty + gNVSVDirtyRefused) & 4095) == 0)
+             ALOG("surfvram dirty: surface %u plane %u type 0x%x -> %#x (dirty %u, refused %u)", p->surfaceID, p->plane,
+                  res ? (unsigned)((volatile unsigned char *)res)[0x14] : 0u, p->status, gNVSVDirty, gNVSVDirtyRefused);
+@@ -1226,6 +2129,14 @@
+         p->status = g.status; p->hSrcClient = g.hClient; p->hSrcMemory = g.hObject; p->size = vm->fBytes;
+     }
+     if (p->status == 0) gNVSVOk++; else gNVSVRefused++;
++    if (p->status == 0 && vm) vm->noteImport(p->hClient, p->surfaceID);
++    { const unsigned pid = (unsigned)proc_selfpid(); const unsigned st = p->status, vmLo = nvLo(vm), rmLo = vm ? nvLo(vm->fRmHandle) : 0u;
++      const unsigned by = vm ? (unsigned)vm->fBytes : 0u;
++      NVSS_DO(p->surfaceID, surf, { if (st == 0) e->sh++; else e->shFail++; e->shStatus = st; e->shPid = pid; e->shMs = now_;
++                                    e->shVm = vmLo; e->shRm = rmLo; e->shBytes = by; });
++      if (gFamDiag > 0) { OSDecrementAtomic((volatile SInt32 *)&gFamDiag);
++          ALOG("FAMDIAG SHARE surf %u plane %u pid %u -> status %#x vm %08x rm %08x %u bytes lazy %d kva %d", p->surfaceID, p->plane, pid, st,
++               vmLo, rmLo, by, vm ? (int)vm->fLazy : -1, (vm && vm->fKva) ? 1 : 0); } }
+     if (gNVSVOk + gNVSVRefused <= 8 || ((gNVSVOk + gNVSVRefused) & 1023) == 0)
+         ALOG("surfvram: surface %u plane %u -> cache %p res %p vidmem %p (%llu B) -> client %#x mem %#x status %#x (ok %u, refused %u)",
+              p->surfaceID, p->plane, cache, res, vm, vm ? vm->fBytes : 0ull, p->hSrcClient, p->hSrcMemory, p->status, gNVSVOk, gNVSVRefused);
+@@ -1274,19 +2185,36 @@
+     struct NVRMRmHandles h; nvSVZero(&h, sizeof h);
+     void *surf = (r[0x14] == 0xc0 && cache) ? *(void *volatile *)((unsigned char *)cache + 0x10) : nullptr;
+     if (!surf || !vm || !vm->fRmHandle || vm->fScanout || !vm->fBytes || !nvAccelRmHandles(&h)) {
+-        IOAccelResource2::pageoff(ev, a1, out, a3);
++        nvFamNote(this, 6, 0);
++        { const bool f = lazyMapForFamily("pageoff/4"); IOAccelResource2::pageoff(ev, a1, out, a3); lazyUnmapAfterFamily(f); }
++        nvFamNote(this, 6, 1);
+         return;
+     }
+     IOMemoryDescriptor *md = (IOMemoryDescriptor *)_ZNK9IOSurface19getMemoryDescriptorEv(surf);
++    void *retRm = nullptr; unsigned long long retBytes = 0;
++    bool fromRet = vm->fSrcRet && vm->fRetToken && vm->fImpSurf == _ZNK9IOSurface12getSurfaceIDEv(surf);
++    if (fromRet && !nvRetGet(vm->fRetToken, &retRm, &retBytes)) { vm->fRetToken = 0; fromRet = false; }
++    void *const srcRm = fromRet ? retRm : vm->fRmHandle;
++    const unsigned long long srcBytes = fromRet ? retBytes : vm->fBytes;
++    if (!fromRet && vm->onlyStaleImports()) {
++        // Every Metal client of this surface draws into an evicted allocation and copies its pixels to system memory
++        // itself, so system memory is the newest copy; the current VRAM only holds the family's re-back snapshot.
++        OSAddAtomic64(1, &gCntStalePageoff);
++        nvSVPend(_ZNK9IOSurface12getSurfaceIDEv(surf), 0);
++        volatile unsigned short *valid = *(unsigned short *volatile *)(r + 0x30);
++        if (valid) valid[0] |= 1;
++        if (out) *out = true;
++        return;
++    }
+     if (!md || md->prepare(kIODirectionNone) != kIOReturnSuccess) {
+         gNVSVPageoffFail++;
+         ALOG("surfvram pageoff: res %p surface pages could not be wired (md %p) -- family pageoff instead", this, md);
+-        IOAccelResource2::pageoff(ev, a1, out, a3);
++        { const bool f = lazyMapForFamily("pageoff/4"); IOAccelResource2::pageoff(ev, a1, out, a3); lazyUnmapAfterFamily(f); }
+         return;
+     }
+     bool mayUnwire = true;
+     unsigned long long len = md->getLength();
+-    if (len > vm->fBytes) len = vm->fBytes;
++    if (len > srcBytes) len = srcBytes;
+     unsigned long long pages = (len + 4095) >> 12;
+     bool ok = false; unsigned st = NVRM_SS_OFF; unsigned long long usec = 0, cpuUs = 0;
+     bool staged = false;
+@@ -1299,7 +2227,7 @@
+         if (spa) {
+             for (unsigned long long k = 0; k < pages; k++) spa[k] = sp + k * 4096;
+             struct NVRMSurfPageoff q; nvSVZero(&q, sizeof q);
+-            q.version = NVRM_SS_RM_VERSION; q.status = NVRM_SS_OFF; q.kapiDevice = h.kapiDevice; q.kapiMemory = vm->fRmHandle;
++            q.version = NVRM_SS_RM_VERSION; q.status = NVRM_SS_OFF; q.kapiDevice = h.kapiDevice; q.kapiMemory = srcRm;
+             q.pages = spa; q.pageCount = pages; q.length = len;
+             IOService *nvrm = nvAccelNVRM();
+             const OSSymbol *sym = OSSymbol::withCStringNoCopy(NVRM_SS_FN_PAGEOFF);
+@@ -1333,7 +2261,7 @@
+         }
+         if (i == pages) {
+             struct NVRMSurfPageoff q; nvSVZero(&q, sizeof q);
+-            q.version = NVRM_SS_RM_VERSION; q.status = NVRM_SS_OFF; q.kapiDevice = h.kapiDevice; q.kapiMemory = vm->fRmHandle;
++            q.version = NVRM_SS_RM_VERSION; q.status = NVRM_SS_OFF; q.kapiDevice = h.kapiDevice; q.kapiMemory = srcRm;
+             q.pages = pa; q.pageCount = pages; q.length = len;
+             IOService *nvrm = nvAccelNVRM();
+             const OSSymbol *sym = OSSymbol::withCStringNoCopy(NVRM_SS_FN_PAGEOFF);
+@@ -1352,6 +2280,9 @@
+         if (valid) valid[0] |= 1;
+         gNVSVPageoff++;
+     } else gNVSVPageoffFail++;
++    if (ok && fromRet) OSAddAtomic64(1, &gCntRetPageoff);
++    { const bool okc = ok; const unsigned vmLo = nvLo(vm), rmLo = nvLo(srcRm);
++      NVSS_DO(_ZNK9IOSurface12getSurfaceIDEv(surf), surf, { if (okc) e->ceOk++; else e->ceFail++; e->ceVm = vmLo; e->ceRm = rmLo; e->ceLastMs = now_; }); }
+     if (out) *out = ok;
+     if (gNVSVPageoff + gNVSVPageoffFail <= 8 || ((gNVSVPageoff + gNVSVPageoffFail) & 1023) == 0)
+         ALOG("surfvram pageoff: res %p %llu B on the copy engine -> %#x in %llu us%s + cpu %llu us (ok %u, failed %u, staged %u)",
+@@ -1404,6 +2335,7 @@
+ extern "C" {
+ void _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(void *pipe, void *arg);
+ struct thread_call *thread_call_allocate(void (*func)(void *, void *), void *param0);
++
+ int thread_call_enter(struct thread_call *call);
+ }
+ struct NVIopAsync { void *pipe; IOService *fb; IOSurface *s; struct NVRMFlipRequest f; volatile SInt32 busy; struct thread_call *call; };
+@@ -1511,6 +2443,37 @@
+              (long long)n + 1, head, s->getSurfaceID(), W, H, P, f.flipResult);
+     return true;
+ }
++// y540 zflip: can this frame go to the panel straight from its IOSurface's own VRAM? Resolves the RM allocation the way
++// nvAccelIopFlip does (cached, or under the accelerator lock if it is free) and checks that VRAM holds the newest pixels.
++static bool nvAccelZcResolve(IOService *fb, IOSurface *s, void **mem, unsigned long long *cookie)
++{
++    if (!fb || !s || !fb->metaCast("NVRMNVDAFramebuffer")) return false;
++    const unsigned fmt = s->getPixelFormat();
++    if (fmt != 0x42475241u && fmt != 0x6c313072u) { OSAddAtomic64(1, &gCntZcNo[0]); return false; }
++    NVAccel *a = NVAccel::gAccel;
++    if (!a) return false;
++    NVResource *res = nullptr; NVVidMemory *vm = nullptr; void *kmem = nullptr; unsigned long long bytes = 0;
++    if (!nvAccelIopCacheGet(s, &res, &vm, &kmem, &bytes)) {
++        if (!nvFamLock(a, true)) { OSAddAtomic64(1, &gCntZcNo[1]); return false; }
++        void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej((void *)a, (void *)s, 0);
++        OSObject *ctx = cache ? *(OSObject *volatile *)((unsigned char *)cache + 0x20) : nullptr;
++        res = OSDynamicCast(NVResource, ctx);
++        vm = res ? nvres_vidmem(res) : nullptr;
++        kmem = (vm && vm->fRmHandle && vm->fBytes && !vm->fScanout) ? vm->fRmHandle : nullptr;
++        bytes = vm ? vm->fBytes : 0;
++        if (cache) ((OSObject *)cache)->release();
++        nvFamUnlock(a);
++        if (kmem) nvAccelIopCachePut(s, res, vm, kmem, bytes);
++    }
++    if (!kmem || !vm) { OSAddAtomic64(1, &gCntZcNo[1]); return false; }
++    volatile unsigned short *valid = res ? *(unsigned short *volatile *)((volatile unsigned char *)res + 0x30) : nullptr;
++    if (!valid || !(valid[6] & 1u)) { OSAddAtomic64(1, &gCntZcNo[2]); return false; }
++    if (vm->fSrcRet || vm->onlyStaleImports()) { OSAddAtomic64(1, &gCntZcNo[4]); return false; }
++    const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
++    if (!W || !H || P < 4 * W || (P & 255) || H * P > bytes) { OSAddAtomic64(1, &gCntZcNo[3]); return false; }
++    *mem = kmem; *cookie = vm->fAllocationCookie;
++    return true;
++}
+ static int nvaccel_crc_sysctl SYSCTL_HANDLER_ARGS
+ {
+     unsigned v = 0;
+@@ -1540,10 +2503,611 @@
+     if (rr != kIOReturnSuccess && gIopFlipLogs < 8) { gIopFlipLogs++; ALOG("iop: HOME flip refused (0x%x) head %u", (unsigned)rr, head); }
+     gIopFlipped[head] = false;
+ }
+-static void nvAccelSurfScanoutSync(IOSurface *s)
++// ---- Y540 dbuf: double-buffered, vsync-latched scan-out of copied frames -------------------------------------------------
++// Tahoe composites into l10r, which NVKMS cannot scan out, so every frame is copied and narrowed to 8 bpc. That copy used
++// to land in the LIVE boot scanout, on the display pipe's gated work-loop path: no vsync (tearing, worst on the 2560x1440
++// head) and 8-15 MB of BAR1 writes inside the family's gate on every frame. With debug.nvaccel_iop_dbuf=1 every NVIDIA
++// head gets two VRAM buffers of its scanout's geometry (three with =2). A per-head thread call brings the frame to system
++// memory, narrows it into a buffer that is off the panel, commits a pure flip that does not wait (NVRMFB flag 0x2, so no
++// vsync wait inside NVRMFB's display gate, which every head's flips, cursor moves and VRAM grants share), and completes
++// the transaction. Before writing a buffer that may still be on the panel, and before the next flip, the worker waits,
++// holding no lock, for the previous flip to latch (nvFlipPending), so a buffer is never written while it is scanned out.
++// With three buffers only the flip waits: the sync and the copy overlap the previous frame's latch. The family runs one
++// transaction per pipe at a time.
++#ifndef NVRM_FLIP_FLAG_NOWAIT
++#define NVRM_FLIP_FLAG_NOWAIT 0x2u
++#endif
++struct NVIopDb {
++    IOService *fb;                        // the framebuffer the buffers were made for (fFBs holds the reference)
++    struct NVRMVramRequest buf[3];        // the grants: handle, kva, cookie, actualSize
++    unsigned nbuf;                        // 2 or 3
++    unsigned w, h, pitch;                 // the scanout geometry they were made for
++    int  shown;                           // -1: none of ours is on the panel (the boot scanout is), else the buffer last flipped to
++    int  prev;                            // what was on the panel before that flip (still on it while pending)
++    bool pending;                         // that flip was committed without waiting and may not have latched yet
++    bool broken;                          // flips stopped working on this head: copy straight into what is shown
++    unsigned flipFailRun, allocFails;
++    volatile unsigned int *bootKva; unsigned bootPitch;
++    NVDisplayPipe *pipe; IOSurface *s; const volatile unsigned int *src; unsigned sw, sh, sp; bool l10r;
++    volatile SInt32 busy; struct thread_call *call;
++    // y540 dbearly: the frame waiting behind the current one (retained), and whether the current one's transaction completed
++    NVDisplayPipe *pPipe; IOSurface *pS; const volatile unsigned int *pSrc; unsigned psw, psh, psp; bool pl10r;
++    volatile unsigned int *pBootKva; unsigned pBootPitch;
++    volatile SInt32 hasPend, curSignaled;
++    // y540 zflip: this frame (and the one in the slot) flips straight to the surface's own VRAM (shown = -2 while one is
++    // on the panel). zShown is the surface on the panel, zPrev the one that was on it before the pending flip; both are
++    // retained until a later latch proves them off the panel.
++    bool zc, pzc; void *zMem, *pzMem; unsigned long long zCookie, pzCookie;
++    IOSurface *zShown, *zPrev; unsigned zRefuseRun;
++    struct thread_call *callK; uint64_t tEnter;   // y540 dbpar: the KERNEL-group worker, and when the frame was handed to it
++    volatile unsigned zPrevId;                    // y540 zgate: surface ID of zPrev (0: none), read without the worker's state
++};
++static NVIopDb gIopDb[kNvMaxFB];   // zero: no buffers; nvAccelDbAlloc sets shown = -1 before any use
++static unsigned gIopDbLogs;
++#define NVDBLOG(fmt, ...) do { if (gIopDbLogs < 60) { gIopDbLogs++; ALOG("dbuf: " fmt, ##__VA_ARGS__); } } while (0)
++// y540 zflip: the panel moved on to a new flip target (nz: the zero-copy surface now on it, retained; or null)
++static void nvZcShift(NVIopDb *e, IOSurface *nz)
+ {
+-    if (!s || !NVAccel::gAccel || !nvSVPend(_ZNK9IOSurface12getSurfaceIDEv((void *)s), 2)) return;
++    if (e->zPrev) ((OSObject *)e->zPrev)->release();
++    e->zPrev = e->zShown; e->zShown = nz;
++    if (nz) ((OSObject *)nz)->retain();
++    __atomic_store_n(&e->zPrevId, e->zPrev ? e->zPrev->getSurfaceID() : 0u, __ATOMIC_RELEASE);
++}
++// y540 zflip: the last flip latched, so whatever was on the panel before it is off now
++static void nvZcLatched(NVIopDb *e)
++{
++    __atomic_store_n(&e->zPrevId, 0u, __ATOMIC_RELEASE);
++    if (e->zPrev) { ((OSObject *)e->zPrev)->release(); e->zPrev = nullptr; }
++}
++// y540 zflip: the boot scanout is back on the panel (NVRMFB waits for that flip)
++static void nvZcDropAll(NVIopDb *e)
++{
++    __atomic_store_n(&e->zPrevId, 0u, __ATOMIC_RELEASE);
++    if (e->zPrev) { ((OSObject *)e->zPrev)->release(); e->zPrev = nullptr; }
++    if (e->zShown) { ((OSObject *)e->zShown)->release(); e->zShown = nullptr; }
++}
++// y540 zgate (debug.nvaccel_zflip=3): zflip mode 1 completed a frame's transaction only once its flip had latched, because
++// CoreDisplay draws the next frame into the surface the panel is still showing (it alternates two) as soon as the transaction
++// completes. So WindowServer started each frame a whole latch later, and on two displays, with more GPU work a frame, the
++// internal panel's frames missed their vblank (680-700 of 960 in 8 s on the lock screen; mode 2 with no such care: 795-800).
++// In mode 3 the transaction completes at the commit, as in mode 2, and before the plugin commits GPU work that draws into a
++// screen surface it asks here: if that surface is the one the panel still shows until the newest flip latches, this waits
++// (no lock held) for that latch. CPU work for the next frame overlaps the latch wait; only its GPU work waits.
++static bool nvAccelDbWaitLatch(IOService *fb, unsigned maxMs);
++static bool nvZcOffPanelWait(unsigned id, unsigned maxMs)
++{
++    if (!id) return true;
++    OSAddAtomic64(1, &gCntZgAsks);
++    bool ok = true;
++    for (unsigned h = 0; h < kNvMaxFB; h++) {
++        NVIopDb *e = &gIopDb[h];
++        if (__atomic_load_n(&e->zPrevId, __ATOMIC_ACQUIRE) != id || !e->fb) continue;
++        const uint64_t t0 = mach_absolute_time();
++        const bool latched = nvAccelDbWaitLatch(e->fb, maxMs);
++        const SInt64 us = (SInt64)((mach_absolute_time() - t0) / 1000);
++        if (us > 200) { OSAddAtomic64(1, &gCntZgWaits); OSAddAtomic64(us, &gCntZgUs); if (us > gCntZgMaxUs) gCntZgMaxUs = us; }
++        if (!latched) { OSAddAtomic64(1, &gCntZgTimeouts); ok = false; }
++    }
++    return ok;
++}
++static IOSimpleLock *volatile gDbPendLock;
++static IOSimpleLock *nvDbPendLock(void)
++{
++    if (!gDbPendLock) { IOSimpleLock *l = IOSimpleLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gDbPendLock)) IOSimpleLockFree(l); }
++    return gDbPendLock;
++}
++
++static bool nvAccelDbBusy(const void *pipe)
++{
++    // a transaction is open while its frame waits in the slot, or while the worker has it and has not completed it
++    for (unsigned h = 0; h < kNvMaxFB; h++) {
++        const NVIopDb *e = &gIopDb[h];
++        if (e->pPipe == pipe && __atomic_load_n(&e->hasPend, __ATOMIC_ACQUIRE)) return true;
++        if (e->pipe == pipe && __atomic_load_n(&e->busy, __ATOMIC_ACQUIRE) && !__atomic_load_n(&e->curSignaled, __ATOMIC_ACQUIRE)) return true;
++    }
++    return false;
++}
++static void nvAccelDbReset(void)
++{
++    for (unsigned h = 0; h < kNvMaxFB; h++) { gIopDb[h].broken = false; gIopDb[h].allocFails = 0; gIopDb[h].flipFailRun = 0; }
++}
++static void nvAccelDbFree(NVIopDb *e, unsigned head)
++{
+     NVAccel *a = NVAccel::gAccel;
++    for (unsigned k = 0; k < 3; k++) {
++        if (e->buf[k].handle && a) {
++            const IOReturn rr = a->askFramebufferForVram(&e->buf[k], false);
++            if (rr != kIOReturnSuccess) NVDBLOG("head %u: release of buffer %u (%llu bytes) refused (0x%x)", head, k, e->buf[k].actualSize, (unsigned)rr);
++        }
++        nvSVZero(&e->buf[k], sizeof e->buf[k]);
++    }
++    e->w = e->h = e->pitch = e->nbuf = 0; e->fb = nullptr; e->shown = e->prev = -1; e->pending = false; e->broken = false;
++    e->flipFailRun = 0;
++}
++// home: back to the boot scanout (NVRMFB waits for that one); otherwise a no-wait pure flip to buffer k
++static bool nvAccelDbFlip(IOService *fb, const NVIopDb *e, int k, bool home, int *flipResult)
++{
++    struct NVRMFlipRequest f; nvSVZero(&f, sizeof f);
++    f.version = NVRM_FLIP_ABI_VERSION;
++    if (home) f.flags = 1u;
++    else {
++        f.flags = NVRM_FLIP_FLAG_NOWAIT; f.kapiMemory = e->buf[k].handle; f.allocationCookie = e->buf[k].allocationCookie;
++        f.width = e->w; f.height = e->h; f.pitch = e->pitch;
++    }
++    const OSSymbol *sym = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");
++    const IOReturn rr = sym ? fb->callPlatformFunction(sym, false, &f, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
++    if (sym) sym->release();
++    if (flipResult) *flipResult = f.flipResult;
++    if (home) OSAddAtomic64(1, &gCntDbHome);
++    return rr == kIOReturnSuccess;
++}
++// sleeps (no lock held) until the head's last flip has latched; false if it has not after maxMs
++static bool nvAccelDbWaitLatch(IOService *fb, unsigned maxMs)
++{
++    const OSSymbol *sym = OSSymbol::withCStringNoCopy("nvFlipPending");
++    if (!sym) return true;
++    bool ok = false;
++    for (unsigned i = 0; i <= maxMs; i++) {
++        unsigned int pending = 1;
++        const IOReturn rr = fb->callPlatformFunction(sym, false, &pending, nullptr, nullptr, nullptr);
++        if (rr != kIOReturnSuccess) { ok = rr == kIOReturnUnsupported; break; }   // an older NVRMFB waited inside the flip
++        if (!pending) { ok = true; break; }
++        IOSleep(1);
++    }
++    sym->release();
++    return ok;
++}
++static inline unsigned nvL10rTo8(unsigned v)   // A2 R10 G10 B10, little endian: B in bits 0-9, G 10-19, R 20-29
++{
++    return 0xff000000u | (((v >> 22) & 0xffu) << 16) | (((v >> 12) & 0xffu) << 8) | ((v >> 2) & 0xffu);
++}
++static void nvAccelDbCopy(volatile unsigned int *dst, unsigned dpitch, const volatile unsigned int *src, unsigned spitch,
++                          unsigned w, unsigned h, bool l10r)
++{
++    const unsigned long spr = spitch / 4, dpr = dpitch / 4;
++    const bool wide = !(spitch & 7) && !(dpitch & 7) && !((uintptr_t)src & 7) && !((uintptr_t)dst & 7);
++    const unsigned pairs = wide ? w / 2 : 0;
++    // y540 fastcopy: the source is the surface's system-memory pages after the sync (cached, stable), so it is read as
++    // plain memory, four 64-bit words at a time, and only the BAR1 stores stay volatile. The volatile loads kept every
++    // pixel serialized: an l10r frame took 3.0 ms on the panel (2.7 GB/s) against 1.1 ms for a BGRA one.
++    // debug.nvaccel_dbuf_fastcopy=0 brings back the old loop.
++    if (wide && gDbFastCopy) {
++        for (unsigned y = 0; y < h; y++) {
++            const unsigned long long *sp2 = (const unsigned long long *)(uintptr_t)(src + (unsigned long)y * spr);
++            volatile unsigned long long *dp2 = (volatile unsigned long long *)(dst + (unsigned long)y * dpr);
++            unsigned x = 0;
++            if (l10r) {
++                for (; x + 4 <= pairs; x += 4) {
++                    const unsigned long long a = sp2[x], b = sp2[x + 1], c = sp2[x + 2], d = sp2[x + 3];
++                    const unsigned long long ra = (unsigned long long)nvL10rTo8((unsigned)a) | ((unsigned long long)nvL10rTo8((unsigned)(a >> 32)) << 32);
++                    const unsigned long long rb = (unsigned long long)nvL10rTo8((unsigned)b) | ((unsigned long long)nvL10rTo8((unsigned)(b >> 32)) << 32);
++                    const unsigned long long rc = (unsigned long long)nvL10rTo8((unsigned)c) | ((unsigned long long)nvL10rTo8((unsigned)(c >> 32)) << 32);
++                    const unsigned long long rd = (unsigned long long)nvL10rTo8((unsigned)d) | ((unsigned long long)nvL10rTo8((unsigned)(d >> 32)) << 32);
++                    dp2[x] = ra; dp2[x + 1] = rb; dp2[x + 2] = rc; dp2[x + 3] = rd;
++                }
++                for (; x < pairs; x++) { const unsigned long long a = sp2[x];
++                    dp2[x] = (unsigned long long)nvL10rTo8((unsigned)a) | ((unsigned long long)nvL10rTo8((unsigned)(a >> 32)) << 32); }
++                if (w & 1) dst[(unsigned long)y * dpr + w - 1] = nvL10rTo8(src[(unsigned long)y * spr + w - 1]);
++            } else {
++                for (; x + 4 <= pairs; x += 4) {
++                    const unsigned long long a = sp2[x], b = sp2[x + 1], c = sp2[x + 2], d = sp2[x + 3];
++                    dp2[x] = a; dp2[x + 1] = b; dp2[x + 2] = c; dp2[x + 3] = d;
++                }
++                for (; x < pairs; x++) dp2[x] = sp2[x];
++                if (w & 1) dst[(unsigned long)y * dpr + w - 1] = src[(unsigned long)y * spr + w - 1];
++            }
++        }
++        return;
++    }
++    for (unsigned y = 0; y < h; y++) {
++        const volatile unsigned int *sp = src + (unsigned long)y * spr;
++        volatile unsigned int *dp = dst + (unsigned long)y * dpr;
++        const volatile unsigned long long *sp2 = (const volatile unsigned long long *)sp;
++        volatile unsigned long long *dp2 = (volatile unsigned long long *)dp;
++        if (l10r) {
++            for (unsigned x = 0; x < pairs; x++) {
++                const unsigned long long v = sp2[x];
++                dp2[x] = (unsigned long long)nvL10rTo8((unsigned)v) | ((unsigned long long)nvL10rTo8((unsigned)(v >> 32)) << 32);
++            }
++            for (unsigned x = 2 * pairs; x < w; x++) dp[x] = nvL10rTo8(sp[x]);
++        } else {
++            for (unsigned x = 0; x < pairs; x++) dp2[x] = sp2[x];
++            for (unsigned x = 2 * pairs; x < w; x++) dp[x] = sp[x];
++        }
++    }
++}
++static void nvAccelDbLatch(NVIopDb *e, unsigned head, IOService *fb)
++{
++    if (!nvAccelDbWaitLatch(fb, 100)) {
++        OSAddAtomic64(1, &gCntDbLatchTimeout);
++        e->broken = true;
++        NVDBLOG("head %u: the flip to buffer %d did not latch within 100 ms -- no more flips on this head, copying in place", head, e->shown);
++    } else nvZcLatched(e);
++    e->pending = false;
++}
++// y540 boothold (debug.nvaccel_boothold): at boot the panel shows the boot logo (NVRM copies the console into NVRMFB's
++// scanout before the first modeset), but WindowServer's first frames are one colour (black) for about 1.4 s until the boot
++// progress screen draws its own logo - a black blink between two logos (webcam, 2026-10-15 17:07:55.9). Until the first
++// frame on head 0 that has content, one-colour frames stay off the panel (their transaction completes as usual) and the logo
++// stays. The frame with content goes through the copy path (its pixels were just synced to system memory for the check).
++// Once per boot, at most debug.nvaccel_boothold_ms after the first held frame; boot-arg -nvaccelnobh turns it off.
++// Returns 1: content (copy it), 0: one colour (skip it), -1: off or done (the usual path).
++static int nvBootHoldCheck(NVIopDb *e, IOSurface *s)
++{
++    static bool args;
++    if (!args) {
++        args = true;
++        char b[8] = { 0 };
++        if (PE_parse_boot_argn("-nvaccelnobh", b, sizeof b)) { gBootHold = 0; ALOG("boothold: off (-nvaccelnobh)"); return -1; }
++    }
++    if (gBootHold != 1) return -1;
++    if (!s || !e->src || !e->sw || !e->sh || e->sp < 4ull * e->sw) {
++        gBootHold = 0; ALOG("boothold: a frame without a system-memory view -- off"); return -1;
++    }
++    const uint64_t now = mach_absolute_time();
++    if (!gBootHoldT0) gBootHoldT0 = now;
++    uint64_t ns = 0; absolutetime_to_nanoseconds(now - gBootHoldT0, &ns);
++    const unsigned ms = (unsigned)(ns / 1000000);
++    NVSyncInfo si;
++    for (unsigned i = 0; i < 4; i++) {
++        nvSVZero(&si, sizeof si); si.code = -1;
++        nvAccelSurfScanoutSync(s, &si);
++        if (si.code != 1) break;                 // 1 = the accelerator lock was busy and the frame is still only in VRAM
++        IOSleep(1);
++    }
++    if (ms >= (unsigned)gBootHoldMaxMs) {
++        gBootHold = 0;
++        ALOG("boothold: no frame with content within %u ms (%d held) -- WindowServer's frames go to the panel", ms, gBootHoldHeld);
++        return -1;
++    }
++    if (si.code == 1) { gBootHoldHeld++; return 0; }   // not readable yet: keep the logo, look at the next frame
++    const unsigned mask = e->l10r ? 0x3fffffffu : 0x00ffffffu;
++    const volatile unsigned int *p = e->src; const unsigned long spr = e->sp / 4;
++    const unsigned first = p[0] & mask;
++    bool varied = false;
++    // the whole screen 16 x 16, then the middle half every 4 pixels (the boot logo is about 100 px wide at 1080p)
++    for (unsigned i = 0; i < 16 && !varied; i++)
++        for (unsigned j = 0; j < 16; j++) {
++            const unsigned long y = (unsigned long)e->sh * (2 * i + 1) / 32, x = (unsigned long)e->sw * (2 * j + 1) / 32;
++            if ((p[y * spr + x] & mask) != first) { varied = true; break; }
++        }
++    for (unsigned y = e->sh / 4; y < 3 * e->sh / 4 && !varied; y += 4)
++        for (unsigned x = e->sw / 4; x < 3 * e->sw / 4; x += 4)
++            if ((p[(unsigned long)y * spr + x] & mask) != first) { varied = true; break; }
++    if (varied) {
++        gBootHold = 0;
++        ALOG("boothold: surface 0x%x has content after %d one-colour frame(s) kept off the panel for %u ms -- on the panel now",
++             s->getSurfaceID(), gBootHoldHeld, ms);
++        return 1;
++    }
++    if (++gBootHoldHeld == 1)
++        ALOG("boothold: WindowServer's first frame on the external display (head 1) is one colour 0x%06x -- its boot logo stays until a frame has content (at most %d ms)",
++             first, gBootHoldMaxMs);
++    return 0;
++}
++static void nvAccelDbRun(void *p0, void *)
++{
++    NVIopDb *e = (NVIopDb *)p0;
++    const unsigned head = (unsigned)(e - gIopDb);
++    if (head < 2 && e->tEnter) {   // y540 dbpar: how long the frame waited for its worker to start
++        const SInt64 qd = (SInt64)((mach_absolute_time() - e->tEnter) / 1000);
++        OSAddAtomic64(qd, &gCntDbQdUs[head]); OSAddAtomic64(1, &gCntDbQdN[head]);
++        if (qd > gCntDbQdMaxUs[head]) gCntDbQdMaxUs[head] = qd;
++        if (qd > 2000) OSAddAtomic64(1, &gCntDbQdLate[head]);
++        e->tEnter = 0;
++    }
++  for (;;) {
++    IOSurface *s = e->s; NVDisplayPipe *pipe = e->pipe; IOService *fb = e->fb;
++    bool signaled = false;
++    // y540 zflip mode 1: a frame that goes to the panel straight from its own VRAM completes at the latch, so the surface
++    // it replaces is off the panel before WindowServer draws into it again
++    const bool zLate = e->zc && gZflip == 1;
++    if (gDbEarly && !zLate) {   // y540 dbearly: complete this frame's transaction now; the sync, copy and flip follow
++        __atomic_store_n(&e->curSignaled, 1, __ATOMIC_RELEASE);
++        _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(pipe, nullptr);
++        signaled = true; OSAddAtomic64(1, &gCntDbEarly);
++    }
++    // y540 accbh2: the external display only (head 1). On the panel the black gap before the boot progress screen stays
++    // (it looked more natural to the user); an HDMI monitor needs 2-3 s to wake, so its boot logo must outlast that.
++    const int bh = (head == 1 && gBootHold == 1) ? nvBootHoldCheck(e, s) : -1;   // y540 boothold
++    const uint64_t tz0 = mach_absolute_time();
++    bool zdone = false;
++    if (bh < 0 && e->zc && gZflip && e->zMem && !e->broken) {
++        const unsigned sid = s->getSurfaceID();
++        nvSVInflightWait(sid, 100);                       // the frame's GPU work must be done before it is scanned out
++        const uint64_t tz1 = mach_absolute_time();
++        if (e->pending) nvAccelDbLatch(e, head, fb);      // NVKMS takes one flip at a time
++        const uint64_t tz2 = mach_absolute_time();
++        if (!e->broken) {
++            struct NVRMFlipRequest f; nvSVZero(&f, sizeof f);
++            f.version = NVRM_FLIP_ABI_VERSION; f.flags = NVRM_FLIP_FLAG_NOWAIT | (e->l10r ? NVRM_FLIP_FLAG_L10R : 0u);
++            f.kapiMemory = e->zMem; f.allocationCookie = e->zCookie; f.width = e->sw; f.height = e->sh; f.pitch = e->sp;
++            const OSSymbol *sym = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");
++            const IOReturn rr = sym ? fb->callPlatformFunction(sym, false, &f, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
++            if (sym) sym->release();
++            const uint64_t tz3 = mach_absolute_time();
++            OSAddAtomic64((SInt64)((tz3 - tz2) / 1000), &gCntDbFlipUs);
++            if (rr == kIOReturnSuccess) {
++                e->prev = e->shown; e->shown = -2; e->pending = true; e->flipFailRun = 0; e->zRefuseRun = 0; gIopFlipped[head] = false;
++                nvZcShift(e, s);
++                const SInt64 n = OSAddAtomic64(1, &gCntZcFrames); OSAddAtomic64(1, &gCntDbFrames); OSAddAtomic64(1, &gCntDbFramesHead[head]);
++                if (n < 2 || n == 1000 || n == 100000)
++                    NVDBLOG("zflip frame #%lld (head %u): surface 0x%x %ux%u pitch %u scanned out of its own VRAM (%s)", (long long)n + 1,
++                            head, sid, e->sw, e->sh, e->sp, e->l10r ? "l10r as X2B10G10R10, R/B swapped by the CSC" : "BGRA");
++                zdone = true;
++                if (zLate) {
++                    nvAccelDbLatch(e, head, fb);
++                    OSAddAtomic64((SInt64)((mach_absolute_time() - tz3) / 1000), &gCntZcLatchUs);
++                }
++            } else {
++                OSAddAtomic64(1, &gCntZcRefused);
++                if (++e->zRefuseRun >= 3 && gZflip) {
++                    gZflip = 0;
++                    NVDBLOG("zflip: 3 direct flips refused in a row (flipResult %d) -- debug.nvaccel_zflip=0, frames are copied", f.flipResult);
++                } else NVDBLOG("zflip: direct flip of surface 0x%x refused (flipResult %d) -- this frame is copied", sid, f.flipResult);
++            }
++        }
++        const SInt64 gus = (SInt64)((tz1 - tz0) / 1000);
++        OSAddAtomic64(gus, &gCntZcGpuUs); if (gus > gCntZcGpuMaxUs) gCntZcGpuMaxUs = gus;
++        OSAddAtomic64((SInt64)((tz2 - tz1) / 1000), &gCntDbWaitUs);
++    }
++    if (!zdone && bh != 0) {
++    const uint64_t t0 = mach_absolute_time();
++    NVSyncInfo si;
++    for (unsigned i = 0; i < 4; i++) {
++        nvSVZero(&si, sizeof si); si.code = -1;
++        nvAccelSurfScanoutSync(s, &si);
++        if (si.code != 1) break;                 // 1 = the accelerator lock was busy and the frame is still only in VRAM
++        OSAddAtomic64(1, &gCntDbSyncRetry);
++        IOSleep(1);
++    }
++    const uint64_t t1 = mach_absolute_time();
++    // two buffers: while the last flip is pending, both are (or may be) on the panel, so wait for the latch before writing
++    if (e->pending && !e->broken && e->nbuf < 3) nvAccelDbLatch(e, head, fb);
++    const uint64_t t2 = mach_absolute_time();
++    int k = -1; volatile unsigned int *dst = nullptr; unsigned dpitch = e->pitch;
++    if (!e->broken) {
++        for (int i = 0; i < (int)e->nbuf; i++) if (i != e->shown && !(e->pending && i == e->prev)) { k = i; break; }
++        if (k >= 0) dst = (volatile unsigned int *)e->buf[k].kva;
++    } else if (e->shown >= 0) dst = (volatile unsigned int *)e->buf[e->shown].kva;
++    else { dst = e->bootKva; dpitch = e->bootPitch; }
++    if (dst && dpitch >= 4ull * e->sw) nvAccelDbCopy(dst, dpitch, e->src, e->sp, e->sw, e->sh, e->l10r);
++    const uint64_t t3 = mach_absolute_time();
++    // a flip may only be committed once the previous one latched (NVKMS refuses a second one in flight)
++    if (k >= 0 && e->pending) { nvAccelDbLatch(e, head, fb); if (e->broken) k = -1; }
++    const uint64_t t3b = mach_absolute_time();
++    if (k >= 0) {
++        int fr = 0;
++        if (nvAccelDbFlip(fb, e, k, false, &fr)) {
++            e->prev = e->shown; e->shown = k; e->pending = true; e->flipFailRun = 0; gIopFlipped[head] = false;
++            nvZcShift(e, nullptr);
++            const SInt64 n = OSAddAtomic64(1, &gCntDbFrames); OSAddAtomic64(1, &gCntDbFramesHead[head]);
++            if (n < 2 || n == 1000 || n == 100000)
++                NVDBLOG("frame #%lld (head %u) on buffer %d: %ux%u pitch %u from surface 0x%x (%s)", (long long)n + 1, head, k,
++                        e->w, e->h, e->pitch, s->getSurfaceID(), e->l10r ? "l10r narrowed" : "BGRA");
++        } else {
++            OSAddAtomic64(1, &gCntDbFlipFail);
++            NVDBLOG("head %u: flip to buffer %d REFUSED (flipResult %d) -- that frame stays off the panel", head, k, fr);
++            if (++e->flipFailRun >= 3) { e->broken = true; NVDBLOG("head %u: 3 refused flips in a row -- copying in place from now on", head); }
++        }
++    } else OSAddAtomic64(1, &gCntDbDirect);
++    const uint64_t t4 = mach_absolute_time();
++    const SInt64 copyUs = (SInt64)((t3 - t2) / 1000);
++    OSAddAtomic64((SInt64)((t2 - t1 + t3b - t3) / 1000), &gCntDbWaitUs); OSAddAtomic64((SInt64)((t1 - t0) / 1000), &gCntDbSyncUs);
++    OSAddAtomic64(copyUs, &gCntDbCopyUs); OSAddAtomic64((SInt64)((t4 - t3b) / 1000), &gCntDbFlipUs);
++    if (copyUs > gCntDbCopyMaxUs) gCntDbCopyMaxUs = copyUs;
++    }   // !zdone
++    if (zdone) {
++        const SInt64 tus = (SInt64)((mach_absolute_time() - tz0) / 1000);
++        OSAddAtomic64(tus, &gCntZcTxnUs); if (tus > gCntZcTxnMaxUs) gCntZcTxnMaxUs = tus;
++    }
++    e->s = nullptr; e->src = nullptr;
++    ((OSObject *)s)->release();
++    bool more = false;
++    IOSimpleLock *lk = nvDbPendLock();
++    if (lk) IOSimpleLockLock(lk);
++    if (__atomic_load_n(&e->hasPend, __ATOMIC_ACQUIRE)) {   // y540 dbearly: take the frame that waited in the slot
++        e->pipe = e->pPipe; e->s = e->pS; e->src = e->pSrc; e->sw = e->psw; e->sh = e->psh; e->sp = e->psp; e->l10r = e->pl10r;
++        e->bootKva = e->pBootKva; e->bootPitch = e->pBootPitch;
++        e->zc = e->pzc; e->zMem = e->pzMem; e->zCookie = e->pzCookie;
++        e->pPipe = nullptr; e->pS = nullptr; e->pSrc = nullptr;
++        __atomic_store_n(&e->curSignaled, 0, __ATOMIC_RELEASE);
++        __atomic_store_n(&e->hasPend, 0, __ATOMIC_RELEASE);
++        more = true;
++    } else __atomic_store_n(&e->busy, 0, __ATOMIC_RELEASE);
++    if (lk) IOSimpleLockUnlock(lk);
++    if (!signaled) _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(pipe, nullptr);
++    ((OSObject *)pipe)->release();
++    if (!more) break;
++  }
++}
++static bool nvAccelDbAlloc(NVIopDb *e, IOService *fb, unsigned head, const struct NVRMVramRequest *q, unsigned nbuf)
++{
++    NVAccel *a = NVAccel::gAccel;
++    if (!a || e->allocFails >= 3) return false;
++    if (e->buf[0].handle || e->buf[1].handle || e->buf[2].handle) {
++        // a new geometry means NVRMFB set the mode again, which put its boot scanout back on the panel; make sure of it
++        if (e->shown != -1 && e->fb) { int fr = 0; nvAccelDbFlip(e->fb, e, 0, true, &fr); }
++        nvZcDropAll(e);
++        NVDBLOG("head %u: scanout %ux%u pitch %u, %u buffers wanted (had %u of %ux%u pitch %u) -- remaking them", head, q->width,
++                q->height, q->pitch, nbuf, e->nbuf, e->w, e->h, e->pitch);
++        nvAccelDbFree(e, head);
++    }
++    const unsigned long long bytes = (unsigned long long)q->pitch * q->height;
++    for (unsigned k = 0; k < nbuf; k++) {
++        struct NVRMVramRequest *r = &e->buf[k];
++        nvSVZero(r, sizeof *r);
++        r->version = NVRM_VRAM_ABI_VERSION; r->size = bytes;
++        const IOReturn rr = a->askFramebufferForVram(r, true);
++        if (rr != kIOReturnSuccess || !r->kva || !r->handle || r->actualSize < bytes) {
++            OSAddAtomic64(1, &gCntDbAllocFail); e->allocFails++;
++            NVDBLOG("head %u: VRAM for buffer %u (%llu bytes) refused (0x%x, kva %p) -- this head copies into the boot scanout",
++                    head, k, bytes, (unsigned)rr, r->kva);
++            if (rr != kIOReturnSuccess) nvSVZero(r, sizeof *r);
++            nvAccelDbFree(e, head);
++            return false;
++        }
++    }
++    e->fb = fb; e->w = q->width; e->h = q->height; e->pitch = q->pitch; e->nbuf = nbuf;
++    e->shown = e->prev = -1; e->pending = false; e->broken = false; e->flipFailRun = 0; e->allocFails = 0;
++    NVDBLOG("head %u: %u buffers of %ux%u pitch %u (%llu bytes each) at phys 0x%llx, 0x%llx, 0x%llx", head, nbuf, e->w, e->h,
++            e->pitch, e->buf[0].actualSize, e->buf[0].phys, e->buf[1].phys, e->buf[2].phys);
++    return true;
++}
++static bool nvAccelDbStart(NVDisplayPipe *pipe, IOService *fb, unsigned head, IOSurface *s, const volatile unsigned int *src,
++                           unsigned w, unsigned h, unsigned pitch, bool l10r, const struct NVRMVramRequest *q,
++                           bool zc, void *zMem, unsigned long long zCookie)
++{
++    if (head >= kNvMaxFB || !pipe || !fb || !s || !src || !q || !q->kva) return false;
++    NVIopDb *e = &gIopDb[head];
++    if (__atomic_load_n(&e->busy, __ATOMIC_ACQUIRE)) {
++        // y540 dbearly: the worker still has the previous frame (whose transaction already completed); this one waits in
++        // the slot and completes when the worker takes it. Same geometry only; anything else goes the old way.
++        IOSimpleLock *lk = gDbEarly ? nvDbPendLock() : nullptr;
++        bool stored = false, idle = false;
++        if (lk && e->fb == fb && w == e->w && h == e->h && pitch >= 4 * w && q->width == e->w && q->height == e->h && q->pitch == e->pitch) {
++            IOSimpleLockLock(lk);
++            if (!__atomic_load_n(&e->busy, __ATOMIC_ACQUIRE)) idle = true;
++            else if (!__atomic_load_n(&e->hasPend, __ATOMIC_ACQUIRE)) {
++                ((OSObject *)s)->retain(); ((OSObject *)pipe)->retain();
++                e->pPipe = pipe; e->pS = s; e->pSrc = src; e->psw = w; e->psh = h; e->psp = pitch; e->pl10r = l10r;
++                e->pBootKva = (volatile unsigned int *)q->kva; e->pBootPitch = q->pitch;
++                e->pzc = zc; e->pzMem = zMem; e->pzCookie = zCookie;
++                __atomic_store_n(&e->hasPend, 1, __ATOMIC_RELEASE); stored = true;
++            }
++            IOSimpleLockUnlock(lk);
++        }
++        if (stored) { OSAddAtomic64(1, &gCntDbPend); return true; }
++        if (!idle) { OSAddAtomic64(1, &gCntDbBusy); return false; }
++    }
++    const unsigned nbuf = gIopDbuf >= 2 ? 3 : 2;
++    if (e->fb != fb || e->w != q->width || e->h != q->height || e->pitch != q->pitch || e->nbuf != nbuf)
++        if (!nvAccelDbAlloc(e, fb, head, q, nbuf)) return false;
++    if (w != e->w || h != e->h || pitch < 4 * w) return false;
++    if (!e->call) e->call = thread_call_allocate(nvAccelDbRun, e);
++    if (!e->callK) e->callK = thread_call_allocate_with_options(nvAccelDbRun, e, THREAD_CALL_PRIORITY_KERNEL, 0);   // y540 dbpar
++    if (!e->call) return false;
++    e->bootKva = (volatile unsigned int *)q->kva; e->bootPitch = q->pitch;
++    ((OSObject *)s)->retain(); ((OSObject *)pipe)->retain();
++    e->pipe = pipe; e->s = s; e->src = src; e->sw = w; e->sh = h; e->sp = pitch; e->l10r = l10r;
++    e->zc = zc; e->zMem = zMem; e->zCookie = zCookie;
++    __atomic_store_n(&e->curSignaled, 0, __ATOMIC_RELEASE);
++    __atomic_store_n(&e->busy, 1, __ATOMIC_RELEASE);
++    e->tEnter = mach_absolute_time();
++    thread_call_enter((gDbPar && e->callK) ? e->callK : e->call);
++    return true;
++}
++// The copy path is about to run for this head: if a dbuf buffer is on the panel, go back to the boot scanout first. If
++// NVRMFB refuses that, the copy goes into the buffer that is on the panel (so the panel keeps updating).
++static volatile unsigned int *nvAccelDbLegacyTarget(IOService *fb, unsigned head, const struct NVRMVramRequest *q)
++{
++    if (head >= kNvMaxFB) return nullptr;
++    NVIopDb *e = &gIopDb[head];
++    if (__atomic_load_n(&e->busy, __ATOMIC_ACQUIRE)) return nullptr;
++    if (!e->buf[0].handle && !e->buf[1].handle) return nullptr;
++    if (e->shown != -1 && e->fb == fb) {
++        int fr = 0;
++        if (!nvAccelDbFlip(fb, e, 0, true, &fr)) {
++            NVDBLOG("head %u: home flip refused (flipResult %d) -- copying into buffer %d, which stays on the panel", head, fr, e->shown);
++            if (e->shown >= 0 && e->w == q->width && e->h == q->height && e->pitch == q->pitch) return (volatile unsigned int *)e->buf[e->shown].kva;
++            return nullptr;
++        }
++        NVDBLOG("head %u: back on the boot scanout (dbuf %s)", head, gIopDbuf ? "declined a frame" : "switched off");
++        e->shown = -1; e->pending = false; nvZcDropAll(e);
++    }
++    if (!gIopDbuf) nvAccelDbFree(e, head);
++    return nullptr;
++}
++// Y540 login-flicker study: which surface goes to the panel blank, and what state its VRAM copy is in.
++static void nvAccelSurfInfo(IOSurface *s, NVSyncInfo *si, bool sampleVram, unsigned w, unsigned h, unsigned pitch)
++{
++    if (!s || !si || !NVAccel::gAccel) return;
++    NVAccel *a = NVAccel::gAccel;
++    if (!nvFamLock(a, true)) { si->haveRes = -1; return; }
++    void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej((void *)a, (void *)s, 0);
++    OSObject *ctx = cache ? *(OSObject *volatile *)((unsigned char *)cache + 0x20) : nullptr;
++    NVResource *res = OSDynamicCast(NVResource, ctx);
++    si->haveRes = res ? 1 : (cache ? 2 : 0);
++    if (res) {
++        volatile unsigned char *r = (volatile unsigned char *)res;
++        si->type = r[0x14]; si->fl = *(volatile unsigned int *)(r + 0xc);
++        volatile unsigned short *valid = *(unsigned short *volatile *)(r + 0x30);
++        si->v0 = valid ? valid[0] : 0xffff; si->v6 = valid ? valid[6] : 0xffff;
++        NVVidMemory *vm = nvres_vidmem(res);
++        si->vmBytes = vm ? vm->fBytes : 0; si->lazy = vm ? vm->fLazy : -1; si->mapped = vm ? (vm->fKva != nullptr) : -1;
++        si->vmLo = nvLo(vm); si->rmLo = vm ? nvLo(vm->fRmHandle) : 0u;
++        if (sampleVram && vm && vm->fRmHandle && !vm->fScanout && w && h && pitch >= 4 * w &&
++            (unsigned long long)h * pitch <= vm->fBytes && vm->ensureMapped() && vm->fKva) {
++            const volatile unsigned int *vp = (const volatile unsigned int *)vm->fKva;
++            const unsigned spr = pitch / 4;
++            const unsigned vf = vp[0] & 0xffffffu; int vnz = 0, vv = 0;
++            for (unsigned i = 0; i < 8; i++) for (unsigned j = 0; j < 8; j++) {
++                const unsigned v = vp[(unsigned long)((h * (2 * i + 1)) / 16) * spr + (w * (2 * j + 1)) / 16] & 0xffffffu;
++                if (v) vnz++;
++                if (v != vf) vv++;
++            }
++            si->vnz = vnz; si->vvaried = vv; si->vfirst = vf;
++        }
++    }
++    if (cache) ((OSObject *)cache)->release();
++    nvFamUnlock(a);
++}
++struct NVScan { unsigned nz, total, x0, y0, x1, y1, first; };
++static void nvScan(const volatile unsigned int *p, unsigned w, unsigned h, unsigned spr, unsigned step, NVScan *o)
++{
++    o->nz = 0; o->total = 0; o->x0 = o->y0 = 0xffffffffu; o->x1 = o->y1 = 0; o->first = 0;
++    for (unsigned y = 0; y < h; y += step) {
++        const volatile unsigned int *row = p + (unsigned long)y * spr;
++        for (unsigned x = 0; x < w; x += step) {
++            const unsigned v = row[x] & 0xffffffu; o->total++;
++            if (!v) continue;
++            if (!o->nz) o->first = v;
++            o->nz++;
++            if (x < o->x0) o->x0 = x; if (x > o->x1) o->x1 = x;
++            if (y < o->y0) o->y0 = y; if (y > o->y1) o->y1 = y;
++        }
++    }
++    if (!o->nz) o->x0 = o->y0 = 0;
++}
++// Whole-frame look at one presented surface: what its system memory holds (what the panel gets) and what its VRAM holds
++// (what the GPU drew), read through BAR1 every 4th pixel/row.
++static void nvAccelDeepScan(IOSurface *s, unsigned head, bool blank, const volatile unsigned int *src, unsigned w, unsigned h, unsigned pitch)
++{
++    NVAccel *a = NVAccel::gAccel;
++    if (!a || !s || !src || pitch < 4 * w) return;
++    if (!nvFamLock(a, true)) return;          // try again on a later frame; the budget is only spent on a full scan
++    if (blank) OSDecrementAtomic((volatile SInt32 *)&gDeepBlank); else OSDecrementAtomic((volatile SInt32 *)&gDeepGood);
++    NVScan sy, vr; nvScan(src, w, h, pitch / 4, 1, &sy);
++    vr.nz = vr.total = vr.x0 = vr.y0 = vr.x1 = vr.y1 = vr.first = 0;
++    int got = 0; unsigned vmLo = 0, rmLo = 0, v0 = 0xffffu, v6 = 0xffffu;
++    void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej((void *)a, (void *)s, 0);
++    OSObject *ctx = cache ? *(OSObject *volatile *)((unsigned char *)cache + 0x20) : nullptr;
++    NVResource *res = OSDynamicCast(NVResource, ctx);
++    NVVidMemory *vm = res ? nvres_vidmem(res) : nullptr;
++    if (res && ((volatile unsigned char *)res)[0x14] == 0xc0) {
++        volatile unsigned short *valid = *(unsigned short *volatile *)((volatile unsigned char *)res + 0x30);
++        if (valid) { v0 = valid[0]; v6 = valid[6]; }
++    }
++    if (vm && vm->fRmHandle && !vm->fScanout && (unsigned long long)h * pitch <= vm->fBytes && vm->ensureMapped() && vm->fKva) {
++        nvScan((const volatile unsigned int *)vm->fKva, w, h, pitch / 4, 4, &vr); got = 1;
++    }
++    vmLo = nvLo(vm); rmLo = vm ? nvLo(vm->fRmHandle) : 0u;
++    if (cache) ((OSObject *)cache)->release();
++    nvFamUnlock(a);
++    ALOG("DEEPSCAN %s head %u surf 0x%x %ux%u | sysmem nz %u of %u bbox %u,%u-%u,%u first 0x%06x | vram %s nz %u of %u bbox %u,%u-%u,%u first 0x%06x | vm %08x rm %08x v0 0x%x v6 0x%x",
++         blank ? "BLANK" : "GOOD ", head, s->getSurfaceID(), w, h, sy.nz, sy.total, sy.x0, sy.y0, sy.x1, sy.y1, sy.first,
++         got ? "read" : "UNREADABLE", vr.nz, vr.total, vr.x0, vr.y0, vr.x1, vr.y1, vr.first, vmLo, rmLo, v0, v6);
++    NVSS_DO(s->getSurfaceID(), s, e->frVm = vmLo);
++}
++static void nvAccelSurfScanoutSync(IOSurface *s, NVSyncInfo *si)
++{
++    if (si) si->code = 0;
++    if (!s || !NVAccel::gAccel) return;
++    nvSVInflightWait(_ZNK9IOSurface12getSurfaceIDEv((void *)s), 100);   // ws-async: the frame's GPU work must be done first
++    const bool pending = nvSVPend(_ZNK9IOSurface12getSurfaceIDEv((void *)s), 2);
++    if (!pending && !gIopForceSync) return;
++    NVAccel *a = NVAccel::gAccel;
++    if (si) si->code = 1;
+     if (!nvFamLock(a, true)) {
+         if (++gNVSVLockMiss <= 8 || (gNVSVLockMiss & 1023) == 0)
+             ALOG("surfvram scanout: accelerator lock busy, surface %u stays pending (misses %u)",
+@@ -1554,7 +3118,19 @@
+     OSObject *ctx = cache ? *(OSObject *volatile *)((unsigned char *)cache + 0x20) : nullptr;
+     NVResource *res = OSDynamicCast(NVResource, ctx);
+     bool out = false;
++    if (res && !pending) {
++        NVVidMemory *vm = nvres_vidmem(res);
++        volatile unsigned short *valid = *(unsigned short *volatile *)((volatile unsigned char *)res + 0x30);
++        if (!vm || !vm->fRmHandle || vm->fScanout || !valid || !(valid[6] & 1u)) {
++            if (si) si->code = 0;
++            if (cache) ((OSObject *)cache)->release();
++            nvFamUnlock(a);
++            return;
++        }
++        OSAddAtomic64(1, &gCntIopForced);
++    }
+     if (res) res->pageoff(nullptr, true, &out, 0);
++    if (si) si->code = !res ? 4 : !out ? 3 : pending ? 2 : 5;
+     if (!out) nvSVPend(_ZNK9IOSurface12getSurfaceIDEv((void *)s), 0);
+     if (cache) ((OSObject *)cache)->release();
+     nvFamUnlock(a);
+@@ -1670,6 +3246,7 @@
+ static unsigned nvFrontLastSum;
+ static void nvAccelSampleFront(NVVidMemory *vm, unsigned w, unsigned h, unsigned pitch)
+ {
++    if (vm) vm->ensureMapped();
+     if (!vm || !vm->fKva || !pitch || !w || !h) return;
+ #define NVFRONT_EVERY 10u
+     if (++nvFrontFlips % NVFRONT_EVERY) return;
+@@ -1706,6 +3283,7 @@
+     const unsigned w     = *(const volatile unsigned short *)(r + 0xb0);
+     const unsigned h     = *(const volatile unsigned short *)(r + 0xb2);
+     const unsigned pitch = *(const volatile unsigned int   *)(r + 0xb8);
++    if (vm) vm->ensureMapped();
+     if (!vm || !vm->fKva || !pitch || !w || !h) {
+         ALOG("  swap %s: %ux%u pitch %u vm %p kva %p scanout %d -- NOT SAMPLEABLE",
+              tag, w, h, pitch, vm, vm ? vm->fKva : nullptr, vm ? (int)vm->fScanout : -1);
+@@ -1727,6 +3305,7 @@
+ {
+     if (!res) return false;
+     NVVidMemory *vm = nvres_vidmem(res);
++    if (vm) vm->ensureMapped();
+     if (!vm || !vm->fKva) return false;
+     const unsigned char *r = (const unsigned char *)res;
+     const unsigned w     = *(const volatile unsigned short *)(r + 0xb0);
+@@ -1765,7 +3344,9 @@
+     if (!a || !a->fFB) { NVFLIPWHY("copyToScanout: no accelerator/framebuffer"); return false; }
+     if (gNvHeadsPiped & (gNvHeadsPiped - 1)) { NVFLIPWHY("copyToScanout: refused -- heads piped 0x%x, no way to tell whose frame this is", gNvHeadsPiped); return false; }
+     NVVidMemory *vm = nvres_vidmem(res);
++    if (vm) vm->ensureMapped();
+     if (!vm || !vm->fKva) { NVFLIPWHY("copyToScanout: source has no kva"); return false; }
++    vm->noteKva();
+ 
+     const unsigned char *rr = (const unsigned char *)res;
+     const unsigned w     = *(const volatile unsigned short *)(rr + 0xb0);
+diff -ruN a/kexts/NVRM/accel/tahoe_fwd.h b/kexts/NVRM/accel/tahoe_fwd.h
+--- a/kexts/NVRM/accel/tahoe_fwd.h	2026-10-15 17:57:03
++++ b/kexts/NVRM/accel/tahoe_fwd.h	2026-10-13 23:16:46
+@@ -1,10 +1,12 @@
+ // GENERATED by gen_tahoe_fwd.py for the macOS 26 (Tahoe) build. Do not edit.
+ #pragma once
+ #ifdef NM_TAHOE
++// Y540: pageon/pageon3/pageoff3 are overridden by the lazy-BAR1 wrappers in nvaccel_stubs.h, so their base
++// forwarders are plain helpers here (same vtable slots) and the wrappers call them.
+ #define NM_TAHOE_FWD_NVResource \
+-    void pageon(IOAccelEvent* a0, bool a1) override; \
+-    void pageon(IOAccelEvent* a0, bool a1, unsigned long long a2) override; \
+-    void pageoff(IOAccelEvent* a0, bool a1, bool* a2) override; \
++    void nmBasePageon(IOAccelEvent* a0, bool a1); \
++    void nmBasePageon3(IOAccelEvent* a0, bool a1, unsigned long long a2); \
++    void nmBasePageoff3(IOAccelEvent* a0, bool a1, bool* a2); \
+     uint64_t getMemoryAllocParameter() override;
+ #define NM_TAHOE_FWD_NVSysMemory \
+     uint64_t getLength() const override; \
+@@ -86,9 +88,9 @@
+     uint64_t totalTextureMemory() override;
+ #define NM_TAHOE_FWD(cls) NM_TAHOE_FWD_##cls
+ #define NM_TAHOE_FWD_DEFS \
+-__attribute__((naked)) void NVResource::pageon(IOAccelEvent* a0, bool a1) { __asm__("movq __ZTV16IOAccelResource2@GOTPCREL(%rip), %r11\n\tjmpq *448(%r11)"); } \
+-__attribute__((naked)) void NVResource::pageon(IOAccelEvent* a0, bool a1, unsigned long long a2) { __asm__("movq __ZTV16IOAccelResource2@GOTPCREL(%rip), %r11\n\tjmpq *456(%r11)"); } \
+-__attribute__((naked)) void NVResource::pageoff(IOAccelEvent* a0, bool a1, bool* a2) { __asm__("movq __ZTV16IOAccelResource2@GOTPCREL(%rip), %r11\n\tjmpq *464(%r11)"); } \
++__attribute__((naked)) void NVResource::nmBasePageon(IOAccelEvent* a0, bool a1) { __asm__("movq __ZTV16IOAccelResource2@GOTPCREL(%rip), %r11\n\tjmpq *448(%r11)"); } \
++__attribute__((naked)) void NVResource::nmBasePageon3(IOAccelEvent* a0, bool a1, unsigned long long a2) { __asm__("movq __ZTV16IOAccelResource2@GOTPCREL(%rip), %r11\n\tjmpq *456(%r11)"); } \
++__attribute__((naked)) void NVResource::nmBasePageoff3(IOAccelEvent* a0, bool a1, bool* a2) { __asm__("movq __ZTV16IOAccelResource2@GOTPCREL(%rip), %r11\n\tjmpq *464(%r11)"); } \
+ __attribute__((naked)) uint64_t NVResource::getMemoryAllocParameter() { __asm__("movq __ZTV16IOAccelResource2@GOTPCREL(%rip), %r11\n\tjmpq *488(%r11)"); } \
+ __attribute__((naked)) uint64_t NVSysMemory::getLength() const { __asm__("movq __ZTV16IOAccelSysMemory@GOTPCREL(%rip), %r11\n\tjmpq *304(%r11)"); } \
+ __attribute__((naked)) uint64_t NVSysMemory::setTag(unsigned int a0) { __asm__("movq __ZTV16IOAccelSysMemory@GOTPCREL(%rip), %r11\n\tjmpq *376(%r11)"); } \

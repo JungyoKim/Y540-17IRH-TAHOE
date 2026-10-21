@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <key>CFBundleExecutable</key><string>NullMothNVDEC</string>
+  <key>CFBundleIdentifier</key><string>com.nullmoth.NVDEC</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleName</key><string>NullMothNVDEC</string>
+  <key>CFBundlePackageType</key><string>BNDL</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>CMClassImplementations</key>
+  <array>
+    <dict>
+      <key>CMClassID</key><string>com.apple.videotoolbox.videodecoder</string>
+      <key>CMClassImplementationID</key><string>com.nullmoth.videodecoder.hevc.nvdec</string>
+      <key>CMClassImplementationName</key><string>NVIDIA NVDEC HEVC</string>
+      <key>CMClassImplementationVersion</key><integer>1</integer>
+      <key>CMFactoryFunction</key><string>NVDECShim_HEVC_CreateInstance</string>
+      <key>CMManufacturer</key><string>NullMoth</string>
+      <key>CMExecutableArchitectures</key><array><string>x86_64</string></array>
+      <key>CMMatchingInfo</key><dict><key>VTCodecType</key><string>hvc1</string><key>VTIsHardwareAccelerated</key><true/><key>VTRating</key><integer>1000</integer></dict>
+    </dict>
+    <dict>
+      <key>CMClassID</key><string>com.apple.videotoolbox.videodecoder</string>
+      <key>CMClassImplementationID</key><string>com.nullmoth.videodecoder.avc.nvdec</string>
+      <key>CMClassImplementationName</key><string>NVIDIA NVDEC H.264</string>
+      <key>CMClassImplementationVersion</key><integer>1</integer>
+      <key>CMFactoryFunction</key><string>NVDECShim_H264_CreateInstance</string>
+      <key>CMManufacturer</key><string>NullMoth</string>
+      <key>CMExecutableArchitectures</key><array><string>x86_64</string></array>
+      <key>CMMatchingInfo</key><dict><key>VTCodecType</key><string>avc1</string><key>VTIsHardwareAccelerated</key><true/><key>VTRating</key><integer>1000</integer></dict>
+    </dict>
+  </array>
+</dict>
+</plist>
+
