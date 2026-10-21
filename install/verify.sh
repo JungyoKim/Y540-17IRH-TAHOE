@@ -57,7 +57,13 @@ if system_profiler SPAirPortDataType 2>/dev/null | grep -qi 'Card Type: Wi-Fi *(
   plutil -p /System/Library/LaunchDaemons/com.apple.bluetoothd.plist 2>/dev/null | grep -q btsingle && pass "bluetoothd starts with btsingle" || fail "bluetoothd plist has no btsingle"
   plutil -p /System/Library/LaunchAgents/com.apple.sharingd.plist 2>/dev/null | grep -q sdhook && pass "sharingd starts with sdhook" || fail "sharingd plist has no sdhook"
   [ "$(defaults read /Library/Preferences/com.apple.bluetooth NCSecondaryAdvInstance 2>/dev/null)" = 0 ] && pass "NCSecondaryAdvInstance = 0" || fail "NCSecondaryAdvInstance not 0"
-  tail -1 /tmp/btsingle.log 2>/dev/null | grep -q 'now 0f 1f 00' && pass "btsingle patched the running bluetoothd ($(tail -1 /tmp/btsingle.log | cut -d: -f1))" || fail "btsingle did not patch bluetoothd (see /tmp/btsingle.log)"
+  P=$(pgrep -x bluetoothd | head -1)
+  grep -q "pid $P: single: .*now 0f 1f 00" /tmp/btsingle.log 2>/dev/null && pass "btsingle: single-instance advertising path (bluetoothd $P)" || fail "btsingle did not patch bluetoothd $P (see /tmp/btsingle.log)"
+  for k in retry101 "legacyconn v1" "legacyconn v2" nouhe; do grep -q "pid $P: $k: .*patch kr 0" /tmp/btsingle.log 2>/dev/null && pass "btsingle: $k" || fail "btsingle: $k not applied (see /tmp/btsingle.log)"; done
+  grep -q "pid $P: prio: hooked" /tmp/btsingle.log 2>/dev/null && pass "btsingle: advertising priority hook" || fail "btsingle: advertising priority hook missing"
+  grep -q " $P btarb loaded$" /tmp/btarb.log 2>/dev/null && pass "btarb: LE advertising/initiating arbiter loaded" || fail "btarb not loaded in bluetoothd $P (see /tmp/btarb.log)"
+  bt0=$(date -j -f "%a %b %d %T %Y" "$(ps -o lstart= -p "$P" | sed "s/^ *//; s/ *$//")" +%s 2>/dev/null); boot=$(sysctl -n kern.boottime | awk -F'[ ,]+' '{print $4}')
+  [ -n "$bt0" ] && [ $((bt0 - boot)) -lt 180 ] && pass "bluetoothd has run since boot without restarting" || warn "bluetoothd was restarted after boot (see docs/troubleshooting.md)"
   since(){ # process name -> its start time, for a short log window
     local p; p=$(pgrep -x "$1" | head -1); [ -n "$p" ] || return 1
     date -j -f '%a %b %d %T %Y' "$(ps -o lstart= -p "$p" | sed 's/^ *//; s/ *$//')" '+%Y-%m-%d %H:%M:%S'

@@ -52,10 +52,30 @@ because it rebuilds the auxiliary kernel collection and clears KextPolicy, which
 
 ## Bluetooth advertising and AirDrop
 
-- **btsingle.dylib:** Tahoe's bluetoothd always asks for Apple's multi-instance advertising (vendor command 0x148). The
-  BCM20702 answers "unknown command" and bluetoothd leaves its whole advertising stack off: no Handoff, AirDrop or Find
-  My presence. The dylib flips one branch in LeBroadcaster::stackDidStart so bluetoothd uses the single-instance path,
-  after checking the exact bytes. `NCSecondaryAdvInstance = 0` sends AirDrop's advertisement to that one slot.
+- **btsingle.dylib** (src/continuity/btsingle.m + btarb.c) patches the running bluetoothd after checking the exact bytes of
+  every site, and logs to /tmp/btsingle.log and /tmp/btarb.log:
+  1. Tahoe's bluetoothd always asks for Apple's multi-instance advertising (vendor command 0x148). The BCM20702 answers
+     "unknown command" and bluetoothd leaves its whole advertising stack off: no Handoff, AirDrop or Find My presence. One
+     branch in LeBroadcaster::stackDidStart is flipped so bluetoothd uses the single-instance path.
+     `NCSecondaryAdvInstance = 0` sends the non-connectable sets to that one slot.
+  2. A start that crossed a stop of the one slot fails with status 101 and bluetoothd never retried, leaving the Mac silent
+     for minutes. 101 now takes the retry path bluetoothd already has for status 0x76.
+  3. The connectable set (NearbyInfo / NearbyAction, which carries the same-account identity and the companion-link
+     request) and the AirDrop 0x05 set kept replacing each other on the single slot, so the iPhone lost the Mac. A hook on
+     -[WPDAdvertisingManager advertisingRules] hands only the connectable set to the stack when both are wanted
+     (kill switch /Library/NullMoth/no-btprio).
+  4. bluetoothd sends the Bluetooth 5 LE Extended Create Connection; the setters of gEnableExtendedCreateConnectionCommand
+     (V1, V2) now store 0, so the legacy LE Create Connection is used (no-btlegacyconn).
+  5. The chip's LE Supported States (0x1fffffff) lack "connectable advertising + initiating" and "connectable advertising
+     + master role". Every LE connection the Mac started (phone call, Instant Hotspot, Continuity) was answered with
+     Command Disallowed, bluetoothd retried about 1000 times a second, probed the firmware with an Apple-only command
+     (BD_VSC_READ_FW_INFO, unknown here) and restarted the whole Bluetooth stack ("FW is in UHE Mode", reason 654).
+     btarb, on the USB transport, turns advertising off just before an LE Create Connection and back on when the attempt
+     ends and no master link is left; while initiating or connected, bluetoothd's own Advertising Enable(1) reaches the
+     chip as (0). Its own commands are sent only when no bluetoothd command is outstanding, and their Command Complete
+     events are passed on as the HCI no-op (opcode 0x0000), rewritten in place (no-btarb). The UHE verdict after the
+     failed firmware probe no longer restarts the stack (no-btnouhe). Advertising pauses for the 2-4 s of a typical
+     connection.
 - **sdhook.dylib:** sharingd never matched the iPhone seen over Bluetooth to its iCloud identity (the controller does not
   resolve its private address), so the iPhone lacked the MyiCloud flag and AirDrop discovery dropped it. The hook sets
   that flag for same-account identities, which is what Sharing.framework does itself inside a virtual machine.
