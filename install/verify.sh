@@ -62,6 +62,9 @@ if system_profiler SPAirPortDataType 2>/dev/null | grep -qi 'Card Type: Wi-Fi *(
   for k in retry101 "legacyconn v1" "legacyconn v2" nouhe; do grep -q "pid $P: $k: .*patch kr 0" /tmp/btsingle.log 2>/dev/null && pass "btsingle: $k" || fail "btsingle: $k not applied (see /tmp/btsingle.log)"; done
   grep -q "pid $P: prio: hooked" /tmp/btsingle.log 2>/dev/null && pass "btsingle: advertising priority hook" || fail "btsingle: advertising priority hook missing"
   grep -q " $P btarb loaded$" /tmp/btarb.log 2>/dev/null && pass "btarb: LE advertising/initiating arbiter loaded" || fail "btarb not loaded in bluetoothd $P (see /tmp/btarb.log)"
+  if grep -Eq " $P le conn complete status 0x00 handle 0x[0-9a-f]+ role 0 " /tmp/btarb.log 2>/dev/null; then
+    grep -Eq " $P (adv params scannable|bd adv params: type 0 -> 2)" /tmp/btarb.log && pass "btarb: advertising kept (scannable) during master links" || warn "btarb: a master link came up but advertising was not switched to scannable (see /tmp/btarb.log)"
+  fi
   bt0=$(date -j -f "%a %b %d %T %Y" "$(ps -o lstart= -p "$P" | sed "s/^ *//; s/ *$//")" +%s 2>/dev/null); boot=$(sysctl -n kern.boottime | awk -F'[ ,]+' '{print $4}')
   [ -n "$bt0" ] && [ $((bt0 - boot)) -lt 180 ] && pass "bluetoothd has run since boot without restarting" || warn "bluetoothd was restarted after boot (see docs/troubleshooting.md)"
   since(){ # process name -> its start time, for a short log window

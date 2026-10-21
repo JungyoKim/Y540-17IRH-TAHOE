@@ -1,15 +1,22 @@
 // btarb.c -- LE advertising/initiating arbiter for a BT 4.0 controller (BCM20702) inside bluetoothd.
-// The chip's LE Supported States (0x1fffffff) lack "connectable advertising + initiating" and "connectable advertising +
-// master role" (BT 4.1 bits 32/35). macOS keeps connectable NearbyInfo advertising on, so every LE Create Connection is
-// answered with Command Disallowed and bluetoothd retries about 1000 times a second until it restarts the stack.
-// This shim sits on the USB transport (HCI commands = class control requests, events = interrupt pipe reads):
+// The chip's LE Supported States (0x1fffffff = BT 4.0 bits 0-28) lack "connectable advertising + initiating" and
+// "connectable advertising + master role" (BT 4.1 bits 32/35) but have "scannable advertising + initiating" and
+// "scannable advertising + master role" (bits 17/19). macOS keeps connectable NearbyInfo advertising on, so every LE
+// Create Connection is answered with Command Disallowed and bluetoothd retries about 1000 times a second until it
+// restarts the stack. This shim sits on the USB transport (HCI commands = class control requests, events = interrupt
+// pipe reads):
 //  - on LE Create Connection while connectable advertising runs, it first sends LE Set Advertising Enable(0) itself;
-//  - while initiating or holding a master-role link, bluetoothd's own Advertising Enable(1) goes to the chip as (0);
-//  - when the attempt ends (Command Status error, LE Connection Complete) and no master link is left, it re-enables
-//    advertising at the next point where the chip is idle (one HCI command at a time, see below);
+//  - while initiating with connectable parameters, bluetoothd's own Advertising Enable(1) goes to the chip as (0);
+//  - while a master-role link is up (a BLE mouse, for example), advertising keeps running as scannable undirected
+//    advertising (ADV_SCAN_IND, interval at least 100 ms as BT 4.0 requires for that type): bluetoothd's LE Set
+//    Advertising Parameters are rewritten, and before its Advertising Enable(1) the chip is reprogrammed if it still
+//    holds connectable parameters. After the last master link is gone the original parameters go back;
+//  - when an attempt ends (Command Status error, LE Connection Complete) it re-enables advertising at the next point
+//    where the chip is idle (one HCI command at a time, see below);
 //  - Command Complete events for its own commands become Command Complete for opcode 0x0000 (the HCI no-op),
 //    rewritten in place; one interrupt read can carry several events and all of them are walked.
-// Kill switch (at launch): /Library/NullMoth/no-btarb. Log: /tmp/btarb.log
+// Kill switches (at launch): /Library/NullMoth/no-btarb (whole shim), /Library/NullMoth/no-btarbscan (hold advertising
+// during master links instead of switching to scannable). Log: /tmp/btarb.log
 #include <IOKit/IOKitLib.h>
 #include <IOKit/IOCFPlugIn.h>
 #include <IOKit/usb/IOUSBLib.h>
@@ -23,7 +30,7 @@
 #include <sys/time.h>
 #include <time.h>
 
-static FILE *L; static pthread_mutex_t LM = PTHREAD_MUTEX_INITIALIZER; static int NLOG, OFF;
+static FILE *L; static pthread_mutex_t LM = PTHREAD_MUTEX_INITIALIZER; static int NLOG, OFF, NOSCAN;
 static void lg(const char *f, ...) {
   pthread_mutex_lock(&LM);
   if (!L) { L = fopen("/tmp/btarb.log", "a"); if (L) setvbuf(L, NULL, _IOLBF, 0); }
@@ -36,26 +43,43 @@ static void lg(const char *f, ...) {
 }
 
 // ---- arbiter state (all under AM) ----
-// The chip takes one HCI command at a time (Num_HCI_Command_Packets = 1). Our own command is only sent when no
-// bluetoothd command is outstanding, and bluetoothd is kept from sending until ours has completed:
-//  - before forwarding a bluetoothd command we may send ours and wait (up to 20 ms) for its Command Complete;
+// The chip takes one HCI command at a time (Num_HCI_Command_Packets = 1). Our own commands are only sent when no
+// bluetoothd command is outstanding, and bluetoothd is kept from sending until ours have completed:
+//  - before forwarding a bluetoothd command we may send ours and wait (up to 20 ms each) for its Command Complete;
 //  - on a bluetoothd Command Complete/Status we may send ours and set that event's credit to 0; the Command Complete
-//    of ours is delivered as an HCI no-op (opcode 0x0000) carrying the credit back.
+//    of ours is delivered as an HCI no-op (opcode 0x0000) carrying the credit back;
+//  - the idle timer may run a short sequence of ours; bluetoothd's next command waits for it (seqBusy).
 static pthread_mutex_t AM = PTHREAD_MUTEX_INITIALIZER;
-static int advDesired, advHw, advType = -1, initiating, ourOut, bdOut, restorePending;
+static int advDesired, advHw, advType = -1, initiating, ourOut, bdOut, restorePending, seqBusy;
 static uint16_t masters[8]; static int nMasters;
+static uint8_t parWant[15], parHw[15]; static int parWantSet, parHwSet;   // LE Set Advertising Parameters: bluetoothd's last, the chip's
+static uint16_t ourOp; static int ourStatus; static unsigned nHold, nRepro, nBdPar;
 static void *gDev; static IOReturn (*gReq)(void *, IOUSBDevRequest *);
-static int connectable(void) { return advType == 0x00 || advType == 0x01 || advType == 0x04; }
-static int blocked(void) { return initiating || nMasters > 0; }
-static int wantRestore(void) { return restorePending && !blocked() && advDesired && !advHw; }
+static int connType(int t) { return t == 0x00 || t == 0x01 || t == 0x04; }
+static int hwConn(void) { return parHwSet ? connType(parHw[4]) : connType(advType); }
+static int blocked(void) { return hwConn() && (initiating || nMasters > 0); }
+static int wantRestore(void) { return restorePending && !blocked() && advDesired && !advHw && !seqBusy; }
+static int canScan(void) { return !NOSCAN && parWantSet && parWant[4] == 0x00; }
+static void scannable(uint8_t *p) {   // 15 parameter bytes: ADV_IND -> ADV_SCAN_IND, interval at least 0x00A0
+  if (p[4] != 0x00) return;
+  unsigned mn = p[0] | (p[1] << 8), mx = p[2] | (p[3] << 8);
+  if (mn < 0xa0) mn = 0xa0;
+  if (mx < mn) mx = mn;
+  p[0] = mn & 0xff; p[1] = mn >> 8; p[2] = mx & 0xff; p[3] = mx >> 8; p[4] = 0x02;
+}
 
-static int sendAdvEnable(uint8_t on, const char *why) {
-  if (!gDev || !gReq) { lg("inject adv %d (%s): no device\n", on, why); return 0; }
-  uint8_t cmd[4] = {0x0a, 0x20, 0x01, on};
-  IOUSBDevRequest q = {0x21, 0x00, 0, 0, 4, cmd, 0};
-  ourOut++;
+static int sendCmd(uint16_t op, const uint8_t *p, unsigned len, const char *why) {
+  if (!gDev || !gReq) { lg("inject %04x (%s): no device\n", op, why); return 0; }
+  if (len > 16) return 0;
+  uint8_t cmd[3 + 16]; cmd[0] = op & 0xff; cmd[1] = op >> 8; cmd[2] = (uint8_t)len; memcpy(cmd + 3, p, len);
+  IOUSBDevRequest q = {0x21, 0x00, 0, 0, (UInt16)(3 + len), cmd, 0};
+  ourOut++; ourOp = op; ourStatus = -1;
   IOReturn r = gReq(gDev, &q);
-  if (r) { ourOut--; lg("inject adv %d (%s) failed 0x%x\n", on, why, r); return 0; }
+  if (r) { ourOut--; lg("inject %04x (%s) failed 0x%x\n", op, why, r); return 0; }
+  return 1;
+}
+static int sendAdvEnable(uint8_t on, const char *why) {
+  if (!sendCmd(0x200a, &on, 1, why)) return 0;
   advHw = on;
   lg("inject adv %d (%s, bd out %d)\n", on, why, bdOut);
   return 1;
@@ -65,6 +89,21 @@ static void waitOurs(void) {   // AM held. If events are read on this very threa
   if (evThreadSet && pthread_equal(evThread, pthread_self())) { pthread_mutex_unlock(&AM); usleep(3000); pthread_mutex_lock(&AM); return; }
   for (int i = 0; i < 20 && ourOut > 0; i++) { pthread_mutex_unlock(&AM); usleep(1000); pthread_mutex_lock(&AM); }
 }
+// AM held, chip idle. Puts bluetoothd's parameters (as scannable when sc) into the chip, switching advertising off first
+// if it runs. Returns 1 when the chip accepted them.
+static int reprogram(int sc, const char *why) {
+  if (!parWantSet || ourOut > 0) return 0;
+  if (advHw) { if (!sendAdvEnable(0, why)) return 0; waitOurs(); if (ourOut > 0) return 0; }
+  uint8_t p[15]; memcpy(p, parWant, 15);
+  if (sc) scannable(p);
+  if (!sendCmd(0x2006, p, 15, why)) return 0;
+  waitOurs();
+  if (ourOut > 0 || ourStatus != 0) { lg("adv params (%s) failed: status %d out %d\n", why, ourStatus, ourOut); parHwSet = 0; return 0; }
+  memcpy(parHw, p, 15); parHwSet = 1;
+  nRepro++;
+  if (nRepro <= 50 || nRepro % 500 == 0) lg("adv params %s: type %u interval %u-%u (masters %d) #%u\n", why, p[4], p[0] | (p[1] << 8), p[2] | (p[3] << 8), nMasters, nRepro);
+  return 1;
+}
 
 // HCI command from bluetoothd (control transfer data). May rewrite the payload in place.
 static void onCommand(uint8_t *d, unsigned n) {
@@ -73,18 +112,32 @@ static void onCommand(uint8_t *d, unsigned n) {
   pthread_mutex_lock(&AM);
   static int thrLogged;
   if (!thrLogged && evThreadSet) { thrLogged = 1; lg("commands on %s thread as events\n", pthread_equal(evThread, pthread_self()) ? "the same" : "a different"); }
+  for (int i = 0; i < 100 && seqBusy; i++) { pthread_mutex_unlock(&AM); usleep(1000); pthread_mutex_lock(&AM); }
   if (ourOut > 0) waitOurs();
-  if (wantRestore() && op != 0x200a && ourOut == 0) { if (sendAdvEnable(1, "restore before command")) waitOurs(); restorePending = 0; }
+  if (wantRestore() && op != 0x200a && op != 0x2006 && ourOut == 0) { if (sendAdvEnable(1, "restore before command")) waitOurs(); restorePending = 0; }
   switch (op) {
-  case 0x2006: if (n >= 8) advType = d[3 + 4]; break;                       // LE Set Advertising Parameters
-  case 0x200a: if (n >= 4) {                                                  // LE Set Advertising Enable
-      advDesired = d[3]; restorePending = 0;
-      if (d[3] == 1 && blocked() && connectable()) { d[3] = 0; advHw = 0; restorePending = 1; lg("hold adv enable (initiating %d masters %d)\n", initiating, nMasters); }
-      else advHw = d[3];
+  case 0x2006: if (n >= 3 + 15) {                                            // LE Set Advertising Parameters
+      memcpy(parWant, d + 3, 15); parWantSet = 1; advType = d[3 + 4];
+      if (nMasters > 0 && canScan()) scannable(d + 3);
+      memcpy(parHw, d + 3, 15); parHwSet = 1;
+      nBdPar++;
+      if (nBdPar <= 20 || nBdPar % 500 == 0) lg("bd adv params: type %u -> %u interval %u-%u (masters %d) #%u\n", parWant[4], parHw[4], parHw[0] | (parHw[1] << 8), parHw[2] | (parHw[3] << 8), nMasters, nBdPar);
     } break;
-  case 0x200d: case 0x2043:                                                   // LE (Extended) Create Connection
+  case 0x200a: if (n >= 4) {                                                   // LE Set Advertising Enable
+      advDesired = d[3]; restorePending = 0;
+      if (d[3] == 1) {
+        if (!initiating && nMasters > 0 && hwConn() && canScan()) reprogram(1, "scannable while master");
+        else if (!initiating && nMasters == 0 && parWantSet && parHwSet && memcmp(parHw, parWant, 15)) reprogram(0, "restore after master");
+        if (blocked()) {
+          d[3] = 0; advHw = 0; restorePending = 1;
+          nHold++;
+          if (nHold <= 20 || nHold % 1000 == 0) lg("hold adv enable (initiating %d masters %d) #%u\n", initiating, nMasters, nHold);
+        } else advHw = 1;
+      } else advHw = 0;
+    } break;
+  case 0x200d: case 0x2043:                                                    // LE (Extended) Create Connection
     initiating = 1;
-    if (advHw && connectable() && ourOut == 0) { if (sendAdvEnable(0, "create connection")) waitOurs(); }
+    if (advHw && hwConn() && ourOut == 0) { if (sendAdvEnable(0, "create connection")) waitOurs(); }
     break;
   }
   bdOut = 1;
@@ -94,16 +147,17 @@ static void onCommand(uint8_t *d, unsigned n) {
 // One HCI event (e = event code, e[1] = parameter length, elen = e[1] + 2 bytes available). Rewrites in place only.
 static void onOneEvent(uint8_t *e, unsigned elen) {
   int cc = e[0] == 0x0e && elen >= 5, cs = e[0] == 0x0f && elen >= 6;
-  if (cc && ourOut > 0 && e[3] == 0x0a && e[4] == 0x20) {                     // Command Complete for our Advertising Enable
-    ourOut--;
-    lg("cc 200a status %u -> nop (bd out %d)\n", elen >= 6 ? e[5] : 255, bdOut);
+  if (cc && ourOut > 0 && (e[3] | (e[4] << 8)) == ourOp) {                     // Command Complete for our own command
+    ourOut--; ourStatus = elen >= 6 ? e[5] : 255;
+    if (ourOp == 0x200a || ourStatus != 0) lg("cc %04x status %d -> nop (bd out %d)\n", ourOp, ourStatus, bdOut);
     e[2] = bdOut ? 0 : 1; e[3] = 0; e[4] = 0;                                  // opcode 0x0000 = no-op; length unchanged
   } else if (cc || cs) {
     uint16_t op = cc ? (e[3] | (e[4] << 8)) : (e[4] | (e[5] << 8));
     uint8_t *credit = cc ? &e[2] : &e[3];
     if (op != 0 && *credit) bdOut = 0;
     if (cs && op == 0x200d && e[2] != 0) { initiating = 0; restorePending = 1; lg("create connection status 0x%02x\n", e[2]); }
-    if (cc && op == 0x0c03) { advDesired = advHw = initiating = nMasters = ourOut = bdOut = restorePending = 0; advType = -1; lg("hci reset\n"); }
+    if (cc && op == 0x2006 && elen >= 6 && e[5] != 0) { parHwSet = 0; lg("bd adv params status 0x%02x\n", e[5]); }
+    if (cc && op == 0x0c03) { advDesired = advHw = initiating = nMasters = ourOut = bdOut = restorePending = parWantSet = parHwSet = 0; advType = -1; lg("hci reset\n"); }
     else if (wantRestore() && bdOut == 0 && ourOut == 0 && *credit && sendAdvEnable(1, "restore at command end")) { restorePending = 0; *credit = 0; }
   } else if (e[0] == 0x3e && elen >= 7 && (e[2] == 0x01 || e[2] == 0x0a)) {        // LE (Enhanced) Connection Complete
     uint8_t st = e[3], role = e[6]; uint16_t h = (e[4] | (e[5] << 8)) & 0xfff;
@@ -111,11 +165,11 @@ static void onOneEvent(uint8_t *e, unsigned elen) {
     if (role == 0 || st != 0) initiating = 0;
     if (st == 0 && role == 0 && nMasters < 8) masters[nMasters++] = h;
     if (st == 0 && role == 1) advHw = 0;                                           // slave link stops advertising
-    if (!blocked()) restorePending = 1;
+    if (advDesired && !advHw) restorePending = 1;
     lg("le conn complete status 0x%02x handle 0x%x role %u (init %d -> %d, masters %d)\n", st, h, role, wasInit, initiating, nMasters);
   } else if (e[0] == 0x05 && elen >= 6) {                                           // Disconnection Complete
     uint16_t h = (e[3] | (e[4] << 8)) & 0xfff;
-    for (int i = 0; i < nMasters; i++) if (masters[i] == h) { masters[i] = masters[--nMasters]; if (!blocked()) restorePending = 1; lg("master 0x%x disconnected (masters %d)\n", h, nMasters); break; }
+    for (int i = 0; i < nMasters; i++) if (masters[i] == h) { masters[i] = masters[--nMasters]; if (advDesired && !advHw) restorePending = 1; lg("master 0x%x disconnected (masters %d)\n", h, nMasters); break; }
   }
 }
 
@@ -136,13 +190,26 @@ static unsigned onEvent(uint8_t *b, unsigned n) {
   return n;
 }
 
-// Fallback: if nothing else gives us a turn within 1.5 s, restore while the chip is idle.
+// Fallback when nothing else gives us a turn: while the chip is idle for about 1 s, switch the parameters to match the
+// link state (scannable during master links, bluetoothd's own afterwards) and restore advertising.
 static void tick(void *unused) {
   (void)unused;
   pthread_mutex_lock(&AM);
   static int idleTicks;
-  if (wantRestore() && bdOut == 0 && ourOut == 0) { if (++idleTicks >= 3) { if (sendAdvEnable(1, "restore when idle")) restorePending = 0; idleTicks = 0; } }
-  else idleTicks = 0;
+  int idle = bdOut == 0 && ourOut == 0 && !seqBusy && !initiating && advDesired;
+  int needScan = idle && nMasters > 0 && hwConn() && canScan();
+  int needBack = idle && nMasters == 0 && parWantSet && parHwSet && memcmp(parHw, parWant, 15);
+  if (needScan || needBack || (wantRestore() && bdOut == 0 && ourOut == 0)) {
+    if (++idleTicks >= 2) {
+      idleTicks = 0;
+      seqBusy = 1;
+      int ok = 1;
+      if (needScan) ok = reprogram(1, "scannable when idle");
+      else if (needBack) ok = reprogram(0, "restore when idle");
+      if (ok && !advHw && advDesired && !blocked() && ourOut == 0) { if (sendAdvEnable(1, "restore when idle")) { waitOurs(); restorePending = 0; } }
+      seqBusy = 0;
+    }
+  } else idleTicks = 0;
   pthread_mutex_unlock(&AM);
 }
 
@@ -202,16 +269,12 @@ __attribute__((used)) static struct { const void *n, *o; } ip[] __attribute__((s
 static dispatch_source_t gTick;
 __attribute__((constructor)) static void init(void) {
   OFF = access("/Library/NullMoth/no-btarb", F_OK) == 0;
+  NOSCAN = access("/Library/NullMoth/no-btarbscan", F_OK) == 0;
   if (!OFF) {
     gTick = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
     dispatch_source_set_timer(gTick, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), 500 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
     dispatch_source_set_event_handler_f(gTick, tick);
     dispatch_resume(gTick);
   }
-  lg("btarb loaded%s\n", OFF ? " (disabled by /Library/NullMoth/no-btarb)" : "");
+  lg("btarb loaded%s%s\n", OFF ? " (disabled by /Library/NullMoth/no-btarb)" : "", NOSCAN ? " (scannable switch off)" : "");
 }
-
-
-
-
-
