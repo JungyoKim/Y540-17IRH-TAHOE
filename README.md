@@ -35,8 +35,9 @@ Tested on the reference laptop in October 2026, macOS 26.7.1 (25G241), BCM94352Z
 - The macOS brightness slider does not work. The Fn brightness keys do (the firmware handles them).
 - One Bluetooth advertising slot: keep AirPlay Receiver off so AirDrop can advertise. Other Continuity features
   (Universal Clipboard, Sidecar, Apple Watch unlock) are untested.
-- While a Bluetooth LE mouse or keyboard is connected, the Mac keeps advertising but as non-connectable (the chip cannot
-  do both), so other devices cannot open an LE connection to it during that time. AirDrop works either way.
+- While a Bluetooth LE mouse or keyboard is connected or being reconnected, the Mac keeps advertising but as
+  non-connectable (the chip cannot do both), so other devices cannot open an LE connection to it during that time.
+  AirDrop works either way.
 - iPhone-to-Mac AirDrop needs a fresh iCloud Bluetooth pairing between the two; the first tries after pairing can fail.
 - The BIOS has no Resizable BAR, so the driver waits about 3 s at boot while it takes over the screen.
 - Samsung PM981 NVMe SSDs do not work with macOS; use another SSD (WD SN750 tested).

@@ -70,18 +70,23 @@ because it rebuilds the auxiliary kernel collection and clears KextPolicy, which
      + master role". Every LE connection the Mac started (phone call, Instant Hotspot, Continuity) was answered with
      Command Disallowed, bluetoothd retried about 1000 times a second, probed the firmware with an Apple-only command
      (BD_VSC_READ_FW_INFO, unknown here) and restarted the whole Bluetooth stack ("FW is in UHE Mode", reason 654).
-     btarb, on the USB transport, turns advertising off just before an LE Create Connection and back on when the attempt
-     ends; while initiating, bluetoothd's own Advertising Enable(1) reaches the chip as (0). Its own commands are sent
-     only when no bluetoothd command is outstanding, and their Command Complete events are passed on as the HCI no-op
-     (opcode 0x0000), rewritten in place (no-btarb). The UHE verdict after the failed firmware probe no longer restarts
-     the stack (no-btnouhe). Advertising pauses for the 2-4 s of a typical connection attempt.
-  6. A master-role link that stays up (a Bluetooth LE mouse or keyboard) used to keep advertising off for as long as it was
-     connected, so the iPhone stopped seeing the Mac and AirDrop from the iPhone failed. The chip does support
-     "scannable advertising + master role" (LE state bit 19), so during such links btarb rewrites bluetoothd's LE Set
-     Advertising Parameters to scannable undirected advertising (ADV_SCAN_IND, interval at least 100 ms as BT 4.0 requires
-     for that type) and reprograms the chip before bluetoothd's Advertising Enable(1) when it still holds connectable
-     parameters; after the last master link the original parameters go back. While such a link is up, other devices
-     cannot open an LE connection to the Mac (kill switch /Library/NullMoth/no-btarbscan restores the old hold).
+     The chip does support "scannable advertising + initiating" and "scannable advertising + master role" (LE state
+     bits 17 and 19). btarb, on the USB transport, therefore keeps advertising on as scannable undirected advertising
+     (ADV_SCAN_IND, interval at least 100 ms as BT 4.0 requires for that type) whenever the Mac initiates an LE
+     connection or holds a master-role link: on LE Create Connection it switches connectable advertising off,
+     reprograms the parameters and switches it back on; bluetoothd's LE Set Advertising Parameters are rewritten; and
+     before bluetoothd's Advertising Enable(1) the chip is reprogrammed if it still holds connectable parameters. After
+     the attempt or the last master link, bluetoothd's own parameters go back. Its own commands are sent only when no
+     bluetoothd command is outstanding; their Command Complete events are passed on as the HCI no-op (opcode 0x0000),
+     rewritten in place, with a credit of 0 when bluetoothd is in the middle of sending its own command (a credit of 1
+     there let bluetoothd put a second command on the chip, which dropped it: "BD_VSC_..._timedout", reason 3602).
+     The UHE verdict after the failed firmware probe no longer restarts the stack (no-btnouhe). Kill switches:
+     no-btarb (whole arbiter), no-btarbscan (hold advertising instead of switching to scannable).
+  6. Why the scannable switch matters: macOS reconnects paired LE devices (a Bluetooth LE mouse, for example) in the
+     background with a long-running LE Create Connection, and a connected LE mouse is a master link that stays up. The
+     first arbiter held advertising off for all of that time (about 200 held Enable commands a second), so the iPhone
+     stopped listing the Mac and AirDrop from the iPhone failed. While scannable, other devices cannot open an LE
+     connection to the Mac; discovery, Handoff presence and AirDrop work.
 - **sdhook.dylib:** sharingd never matched the iPhone seen over Bluetooth to its iCloud identity (the controller does not
   resolve its private address), so the iPhone lacked the MyiCloud flag and AirDrop discovery dropped it. The hook sets
   that flag for same-account identities, which is what Sharing.framework does itself inside a virtual machine.

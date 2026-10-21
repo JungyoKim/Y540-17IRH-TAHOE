@@ -5,12 +5,14 @@
 // Create Connection is answered with Command Disallowed and bluetoothd retries about 1000 times a second until it
 // restarts the stack. This shim sits on the USB transport (HCI commands = class control requests, events = interrupt
 // pipe reads):
-//  - on LE Create Connection while connectable advertising runs, it first sends LE Set Advertising Enable(0) itself;
-//  - while initiating with connectable parameters, bluetoothd's own Advertising Enable(1) goes to the chip as (0);
-//  - while a master-role link is up (a BLE mouse, for example), advertising keeps running as scannable undirected
-//    advertising (ADV_SCAN_IND, interval at least 100 ms as BT 4.0 requires for that type): bluetoothd's LE Set
-//    Advertising Parameters are rewritten, and before its Advertising Enable(1) the chip is reprogrammed if it still
-//    holds connectable parameters. After the last master link is gone the original parameters go back;
+//  - while the Mac initiates an LE connection (macOS also does this in the background, for minutes, to reconnect a
+//    paired LE device that is off or away) or holds a master-role link (a BLE mouse), advertising keeps running as
+//    scannable undirected advertising (ADV_SCAN_IND, interval at least 100 ms as BT 4.0 requires for that type):
+//    on LE Create Connection it switches running connectable advertising off, reprograms and switches it back on;
+//    bluetoothd's LE Set Advertising Parameters are rewritten, and before its Advertising Enable(1) the chip is
+//    reprogrammed if it still holds connectable parameters. Afterwards the original parameters go back;
+//  - if reprogramming is not possible (directed advertising, a failed command), it falls back to holding: on LE Create
+//    Connection it sends Advertising Enable(0) itself, and bluetoothd's own Enable(1) goes to the chip as (0);
 //  - when an attempt ends (Command Status error, LE Connection Complete) it re-enables advertising at the next point
 //    where the chip is idle (one HCI command at a time, see below);
 //  - Command Complete events for its own commands become Command Complete for opcode 0x0000 (the HCI no-op),
@@ -46,18 +48,20 @@ static void lg(const char *f, ...) {
 // The chip takes one HCI command at a time (Num_HCI_Command_Packets = 1). Our own commands are only sent when no
 // bluetoothd command is outstanding, and bluetoothd is kept from sending until ours have completed:
 //  - before forwarding a bluetoothd command we may send ours and wait (up to 20 ms each) for its Command Complete;
+//    those Command Completes carry a credit of 0, because bluetoothd's own command is about to use the slot;
 //  - on a bluetoothd Command Complete/Status we may send ours and set that event's credit to 0; the Command Complete
 //    of ours is delivered as an HCI no-op (opcode 0x0000) carrying the credit back;
 //  - the idle timer may run a short sequence of ours; bluetoothd's next command waits for it (seqBusy).
 static pthread_mutex_t AM = PTHREAD_MUTEX_INITIALIZER;
-static int advDesired, advHw, advType = -1, initiating, ourOut, bdOut, restorePending, seqBusy;
+static int advDesired, advHw, advType = -1, initiating, ourOut, bdOut, restorePending, seqBusy, inCmd;
 static uint16_t masters[8]; static int nMasters;
 static uint8_t parWant[15], parHw[15]; static int parWantSet, parHwSet;   // LE Set Advertising Parameters: bluetoothd's last, the chip's
 static uint16_t ourOp; static int ourStatus; static unsigned nHold, nRepro, nBdPar;
 static void *gDev; static IOReturn (*gReq)(void *, IOUSBDevRequest *);
 static int connType(int t) { return t == 0x00 || t == 0x01 || t == 0x04; }
 static int hwConn(void) { return parHwSet ? connType(parHw[4]) : connType(advType); }
-static int blocked(void) { return hwConn() && (initiating || nMasters > 0); }
+static int constrained(void) { return initiating || nMasters > 0; }
+static int blocked(void) { return hwConn() && constrained(); }
 static int wantRestore(void) { return restorePending && !blocked() && advDesired && !advHw && !seqBusy; }
 static int canScan(void) { return !NOSCAN && parWantSet && parWant[4] == 0x00; }
 static void scannable(uint8_t *p) {   // 15 parameter bytes: ADV_IND -> ADV_SCAN_IND, interval at least 0x00A0
@@ -114,11 +118,12 @@ static void onCommand(uint8_t *d, unsigned n) {
   if (!thrLogged && evThreadSet) { thrLogged = 1; lg("commands on %s thread as events\n", pthread_equal(evThread, pthread_self()) ? "the same" : "a different"); }
   for (int i = 0; i < 100 && seqBusy; i++) { pthread_mutex_unlock(&AM); usleep(1000); pthread_mutex_lock(&AM); }
   if (ourOut > 0) waitOurs();
+  inCmd = 1;
   if (wantRestore() && op != 0x200a && op != 0x2006 && ourOut == 0) { if (sendAdvEnable(1, "restore before command")) waitOurs(); restorePending = 0; }
   switch (op) {
   case 0x2006: if (n >= 3 + 15) {                                            // LE Set Advertising Parameters
       memcpy(parWant, d + 3, 15); parWantSet = 1; advType = d[3 + 4];
-      if (nMasters > 0 && canScan()) scannable(d + 3);
+      if (constrained() && canScan()) scannable(d + 3);
       memcpy(parHw, d + 3, 15); parHwSet = 1;
       nBdPar++;
       if (nBdPar <= 20 || nBdPar % 500 == 0) lg("bd adv params: type %u -> %u interval %u-%u (masters %d) #%u\n", parWant[4], parHw[4], parHw[0] | (parHw[1] << 8), parHw[2] | (parHw[3] << 8), nMasters, nBdPar);
@@ -126,8 +131,8 @@ static void onCommand(uint8_t *d, unsigned n) {
   case 0x200a: if (n >= 4) {                                                   // LE Set Advertising Enable
       advDesired = d[3]; restorePending = 0;
       if (d[3] == 1) {
-        if (!initiating && nMasters > 0 && hwConn() && canScan()) reprogram(1, "scannable while master");
-        else if (!initiating && nMasters == 0 && parWantSet && parHwSet && memcmp(parHw, parWant, 15)) reprogram(0, "restore after master");
+        if (constrained() && hwConn() && canScan()) reprogram(1, nMasters > 0 ? "scannable while master" : "scannable while initiating");
+        else if (!constrained() && parWantSet && parHwSet && memcmp(parHw, parWant, 15)) reprogram(0, "restore after link");
         if (blocked()) {
           d[3] = 0; advHw = 0; restorePending = 1;
           nHold++;
@@ -137,10 +142,14 @@ static void onCommand(uint8_t *d, unsigned n) {
     } break;
   case 0x200d: case 0x2043:                                                    // LE (Extended) Create Connection
     initiating = 1;
-    if (advHw && hwConn() && ourOut == 0) { if (sendAdvEnable(0, "create connection")) waitOurs(); }
+    if (advHw && hwConn() && ourOut == 0) {
+      if (canScan() && reprogram(1, "scannable for create connection")) { if (ourOut == 0 && sendAdvEnable(1, "scannable during create connection")) waitOurs(); }
+      else if (advHw && ourOut == 0) { if (sendAdvEnable(0, "create connection")) waitOurs(); }
+    }
     break;
   }
   bdOut = 1;
+  inCmd = 0;
   pthread_mutex_unlock(&AM);
 }
 
@@ -150,7 +159,7 @@ static void onOneEvent(uint8_t *e, unsigned elen) {
   if (cc && ourOut > 0 && (e[3] | (e[4] << 8)) == ourOp) {                     // Command Complete for our own command
     ourOut--; ourStatus = elen >= 6 ? e[5] : 255;
     if (ourOp == 0x200a || ourStatus != 0) lg("cc %04x status %d -> nop (bd out %d)\n", ourOp, ourStatus, bdOut);
-    e[2] = bdOut ? 0 : 1; e[3] = 0; e[4] = 0;                                  // opcode 0x0000 = no-op; length unchanged
+    e[2] = (bdOut || inCmd) ? 0 : 1; e[3] = 0; e[4] = 0;                       // opcode 0x0000 = no-op; length unchanged
   } else if (cc || cs) {
     uint16_t op = cc ? (e[3] | (e[4] << 8)) : (e[4] | (e[5] << 8));
     uint8_t *credit = cc ? &e[2] : &e[3];
@@ -191,14 +200,14 @@ static unsigned onEvent(uint8_t *b, unsigned n) {
 }
 
 // Fallback when nothing else gives us a turn: while the chip is idle for about 1 s, switch the parameters to match the
-// link state (scannable during master links, bluetoothd's own afterwards) and restore advertising.
+// link state (scannable while initiating or during master links, bluetoothd's own afterwards) and restore advertising.
 static void tick(void *unused) {
   (void)unused;
   pthread_mutex_lock(&AM);
   static int idleTicks;
-  int idle = bdOut == 0 && ourOut == 0 && !seqBusy && !initiating && advDesired;
-  int needScan = idle && nMasters > 0 && hwConn() && canScan();
-  int needBack = idle && nMasters == 0 && parWantSet && parHwSet && memcmp(parHw, parWant, 15);
+  int idle = bdOut == 0 && ourOut == 0 && !seqBusy && advDesired;
+  int needScan = idle && constrained() && hwConn() && canScan();
+  int needBack = idle && !constrained() && parWantSet && parHwSet && memcmp(parHw, parWant, 15);
   if (needScan || needBack || (wantRestore() && bdOut == 0 && ourOut == 0)) {
     if (++idleTicks >= 2) {
       idleTicks = 0;

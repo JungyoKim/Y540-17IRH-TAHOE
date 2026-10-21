@@ -35,11 +35,11 @@
   `defaults read /Library/Preferences/com.apple.bluetooth NCSecondaryAdvInstance` must print 0; AirPlay Receiver must be
   off.
 - **The iPhone does not list the Mac, or lists it and the transfer fails, while a Bluetooth LE mouse or keyboard is
-  connected.** Older builds stopped advertising for as long as the Mac held an LE link as master. /tmp/btarb.log must show
-  `adv params scannable while master` (or `bd adv params: type 0 -> 2`) after a `le conn complete ... role 0` line; a long
-  run of `hold adv enable (initiating 0 masters 1)` means the old build is running. Range is not the limit: the card's
-  antennas receive the router like a desktop Intel AX211 (within a few dB), and AWDL peers were found at -56 to -67 dBm
-  from another room.
+  connected or being reconnected.** Older builds stopped advertising for as long as the Mac initiated an LE connection
+  or held an LE link as master. /tmp/btarb.log must show `adv params scannable ...` or `bd adv params: type 0 -> 2`
+  lines; a long run of `hold adv enable (initiating 1 masters 0)` or `(initiating 0 masters 1)` means an old build
+  is running. Range is not the limit: the card's antennas receive the router like a desktop Intel AX211 (within a few
+  dB), and AWDL peers were found at -56 to -67 dBm from another room.
 - **Bluetooth drops for a moment when the iPhone rings or Instant Hotspot is used.** That was bluetoothd restarting itself
   after a refused LE connection (fixed by btarb, see what-changed.md). If it happens again, look for "Bluetooth error -
   restarting" in bluetoothd's log and for the arbiter's decisions in /tmp/btarb.log. Turning Wi-Fi off and on can still
